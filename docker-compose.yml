@@ -1,6 +1,9 @@
 services:
   torrent2webdav:
-    build: .
+    # Built by .github/workflows/image.yml. If the GHCR package is private,
+    # run `docker login ghcr.io` before pulling.
+    image: ghcr.io/ariizona/torrent2webdav:latest
+    # build: .
     # On Linux, network_mode: host gives the best peer connectivity and lets
     # you drop the ports block below.
     ports:

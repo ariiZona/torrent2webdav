@@ -15,8 +15,13 @@ No database, no download queue, no API server.
 ## Run
 
 ```sh
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
+
+The Compose file pulls `ghcr.io/ariizona/torrent2webdav:latest`, built by the
+GitHub Actions workflow. If that package is private, run `docker login ghcr.io`
+first, or uncomment `build: .` for a local build.
 
 or without Docker:
 
