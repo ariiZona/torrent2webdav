@@ -1,4 +1,5 @@
 cache
 torrents
+.env
 *.exe
 .git

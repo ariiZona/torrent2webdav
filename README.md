@@ -15,6 +15,7 @@ No database, no download queue, no API server.
 ## Run
 
 ```sh
+cp .env.example .env   # optional: choose the BitTorrent port
 docker compose pull
 docker compose up -d
 ```
@@ -47,8 +48,10 @@ Flags and environment variables are equivalent.
 | `-user` | `WEBDAV_USER` | *(empty)* | Enable HTTP basic auth with this user |
 | `-pass` | `WEBDAV_PASS` | *(empty)* | Password for basic auth |
 
-To change the WebDAV port, change `WEBDAV_ADDR` and the container port
-mapping together. `WEBDAV_USER` and `WEBDAV_PASS` must be set together (or both
+With Compose, set `TORRENT_PORT` in `.env` (copy `.env.example`): both the
+published TCP/UDP ports and the app's listen port follow it. Under
+`network_mode: host`, only the listen port matters. To change the WebDAV port,
+change `WEBDAV_ADDR` and the container port mapping together. `WEBDAV_USER` and `WEBDAV_PASS` must be set together (or both
 left empty): a lone username or password stops the app at startup instead of
 serving an unprotected share.
 

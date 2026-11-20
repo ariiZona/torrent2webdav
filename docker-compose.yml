@@ -6,14 +6,17 @@ services:
     # build: .
     # On Linux, network_mode: host gives the best peer connectivity and lets
     # you drop the ports block below.
+    # TORRENT_PORT comes from .env (copy .env.example) or the shell. It sets
+    # both the published ports and the app's listen port.
     ports:
       # WebDAV is bound to localhost by default: put a TLS reverse proxy in
       # front of it before exposing it on the LAN (see README).
       - "127.0.0.1:8080:8080/tcp"
-      - "42069:42069/tcp" # BitTorrent
-      - "42069:42069/udp" # BitTorrent uTP / DHT
+      - "${TORRENT_PORT:-42069}:${TORRENT_PORT:-42069}/tcp" # BitTorrent
+      - "${TORRENT_PORT:-42069}:${TORRENT_PORT:-42069}/udp" # BitTorrent uTP / DHT
     environment:
       TORRENT_FILE: /torrents/example.torrent
+      TORRENT_PORT: "${TORRENT_PORT:-42069}"
       # CACHE_MAX_SIZE: 50G
       # CACHE_TTL: 24h
       # WEBDAV_USER: rclone

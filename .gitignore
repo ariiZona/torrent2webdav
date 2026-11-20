@@ -1,3 +1,4 @@
 /cache/
 /torrents/
+.env
 torrent2webdav.exe
