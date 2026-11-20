@@ -80,10 +80,22 @@ func main() {
 	s := newStream(*torrentFile, *cacheDir, torrentPort, maxBytes, cacheTTL)
 	defer s.Close()
 
-	h := methodWrapper(&webdav.Handler{
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	check := startSelfTest(ctx, torrentPort)
+	dav := methodWrapper(&webdav.Handler{
 		Prefix:     "/",
 		FileSystem: s,
 		LockSystem: webdav.NewMemLS(),
+	})
+	status := newStatusHandler(s, check)
+	var h http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isStatusPath(r.URL.Path) {
+			status.ServeHTTP(w, r)
+			return
+		}
+		dav.ServeHTTP(w, r)
 	})
 	if *user != "" {
 		h = withBasicAuth(*user, *pass, h)
@@ -91,10 +103,7 @@ func main() {
 
 	l := newHTTPLifecycle(h, shutdownGrace)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	log.Printf("webdav on %s", *webdavAddr)
+	log.Printf("webdav on %s (status at /_status)", *webdavAddr)
 	if err := l.serve(ctx, *webdavAddr); err != nil {
 		log.Fatal(err)
 	}
@@ -215,7 +224,8 @@ type stream struct {
 
 	mu       sync.Mutex
 	cond     *sync.Cond
-	active   int // open WebDAV files; eviction waits for zero
+	active   int            // open WebDAV files and status snapshots; eviction waits for zero
+	files    map[string]int // open WebDAV file names, for the status page
 	wiping   bool
 	lastUsed time.Time
 
@@ -243,6 +253,7 @@ func newStream(torrentFile, cacheDir string, port int, maxBytes int64, ttl time.
 		port:     port,
 		maxBytes: maxBytes,
 		ttl:      ttl,
+		files:    map[string]int{},
 		lastUsed: time.Now(),
 		done:     make(chan struct{}),
 		loopDone: make(chan struct{}),
@@ -444,19 +455,65 @@ func (s *stream) OpenFile(ctx context.Context, name string, flag int, perm fs.Fi
 		s.release()
 		return nil, err
 	}
-	return &trackedFile{File: f, s: s}, nil
+	// Directories are opened for listing too; only files are "loaded".
+	tracked := ""
+	if e := sh.lookup(name); e != nil && !e.dir {
+		tracked = name
+		s.mu.Lock()
+		if s.files == nil {
+			s.files = map[string]int{}
+		}
+		s.files[tracked]++
+		s.mu.Unlock()
+	}
+	return &trackedFile{File: f, s: s, name: tracked}, nil
 }
 
-func (s *stream) release() {
+// hold pins the current client and torrent for a status snapshot, so a cache
+// eviction cannot swap them mid-read.
+func (s *stream) hold() (*torrent.Client, *torrent.Torrent) {
 	s.mu.Lock()
+	for s.wiping {
+		s.cond.Wait()
+	}
+	s.active++
+	cl, t := s.cl, s.t
+	s.mu.Unlock()
+	return cl, t
+}
+
+func (s *stream) release() { s.releaseFile("") }
+
+// releaseFile drops one held file or snapshot and wakes a waiting eviction.
+func (s *stream) releaseFile(name string) {
+	s.mu.Lock()
+	if name != "" {
+		if s.files[name] <= 1 {
+			delete(s.files, name)
+		} else {
+			s.files[name]--
+		}
+	}
 	s.active--
 	s.cond.Broadcast()
 	s.mu.Unlock()
 }
 
+func (s *stream) fileList() []statusFile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]statusFile, 0, len(s.files))
+	for name, readers := range s.files {
+		out = append(out, statusFile{Name: name, Readers: readers})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
 type trackedFile struct {
 	webdav.File
 	s    *stream
+	name string
 	once sync.Once
 }
 
@@ -472,7 +529,7 @@ func (f *trackedFile) Seek(offset int64, whence int) (int64, error) {
 
 func (f *trackedFile) Close() error {
 	err := f.File.Close()
-	f.once.Do(f.s.release)
+	f.once.Do(func() { f.s.releaseFile(f.name) })
 	return err
 }
 

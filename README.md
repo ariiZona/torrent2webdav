@@ -33,6 +33,28 @@ go run . -torrent /path/to/file.torrent -cache-dir ./cache
 Put the `.torrent` in `./torrents/` and set `TORRENT_FILE` in
 `docker-compose.yml`.
 
+## Status page
+
+`http://DOCKER_HOST:8080/_status` shows the torrent name and infohash, progress,
+download/upload speed, swarm and peer counts, the files open for streaming, the
+connected peers and the configured trackers. It refreshes once a second from
+`/_status.json`. The paths deliberately start with `_` so a torrent file named
+`status` still resolves through WebDAV.
+
+At startup the app also logs a self-test:
+
+```
+self-test: public IP 203.0.113.9; torrent port 42069/tcp is reachable
+```
+
+It asks `api.ipify.org` for the public IP and `api.networktools.dev` whether the
+BitTorrent port accepts TCP connections from the internet (one check per start;
+the free tier allows 50/day). UDP and the WebDAV port are not tested. The check
+runs in the background, so a slow or unavailable service never delays serving:
+the log says `unknown` and the app continues. A `TIMEOUT` or `CLOSED` result
+means the port is not forwarded or the host is behind CGNAT; downloads then use
+fewer peers.
+
 ## Configure
 
 Flags and environment variables are equivalent.
@@ -70,7 +92,8 @@ and seeking without re-downloading.
 
 ### Auth
 
-With `WEBDAV_USER` / `WEBDAV_PASS` set, add the credentials:
+The status page uses the same credentials. With `WEBDAV_USER` / `WEBDAV_PASS`
+set, add the credentials:
 
 ```sh
 rclone config create t2w webdav url https://DOCKER_HOST/ vendor other \

@@ -1,0 +1,123 @@
+package main
+
+// statusPage is self-contained: it polls /_status.json once a second and
+// renders the snapshot. All untrusted text (torrent name, peer addresses) goes
+// through textContent, never innerHTML.
+const statusPage = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>torrent2webdav</title>
+<style>
+:root { color-scheme: dark }
+body { margin: 0; padding: 1.5rem; font: 14px/1.45 system-ui, sans-serif; background: #101010; color: #ddd }
+main { max-width: 62rem; margin: 0 auto }
+h1 { font-size: 1.3rem; margin: 0 0 .2rem; word-break: break-all }
+h2 { font-size: .75rem; text-transform: uppercase; letter-spacing: .07em; color: #888; margin: 1.6rem 0 .5rem }
+.muted { color: #888 }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: .7rem; margin: 1.2rem 0 0 }
+.card { background: #1a1a1a; border: 1px solid #2b2b2b; border-radius: 6px; padding: .6rem .75rem; min-width: 0 }
+.card span { font-size: .75rem; color: #888; text-transform: uppercase; letter-spacing: .05em }
+.card b { display: block; font-size: 1.1rem; font-weight: 600; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis }
+.bar { height: 6px; background: #2b2b2b; border-radius: 3px; overflow: hidden; margin: .8rem 0 0 }
+.bar > i { display: block; height: 100%; width: 0; background: #4c9 }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums }
+th, td { text-align: left; padding: .32rem .5rem; border-bottom: 1px solid #242424; white-space: nowrap }
+td:first-child, th:first-child { white-space: normal; word-break: break-all }
+th { color: #888; font-weight: 500; font-size: .75rem; text-transform: uppercase; letter-spacing: .05em }
+ul { margin: 0; padding-left: 1.1rem }
+li { word-break: break-all }
+</style>
+</head>
+<body><main>
+<h1 id="name">torrent2webdav</h1>
+<div class="muted" id="hash"></div>
+<div class="bar"><i id="bar"></i></div>
+<div class="grid">
+  <div class="card"><span>Progress</span><b id="progress">-</b></div>
+  <div class="card"><span>Download</span><b id="down">-</b></div>
+  <div class="card"><span>Upload</span><b id="up">-</b></div>
+  <div class="card"><span>Swarm</span><b id="swarm">-</b></div>
+  <div class="card"><span>Public IP</span><b id="ip">-</b></div>
+  <div class="card"><span>BitTorrent port</span><b id="port">-</b></div>
+</div>
+<div class="muted" id="listen" style="margin-top:.5rem"></div>
+<h2>Open files</h2><ul id="files"><li class="muted">none</li></ul>
+<h2>Peers</h2>
+<table><thead><tr><th>Address</th><th>Source</th><th>Down</th><th>Up</th><th>Pieces</th></tr></thead>
+<tbody id="peers"><tr><td colspan="5" class="muted">none</td></tr></tbody></table>
+<h2>Trackers</h2><ul id="trackers"><li class="muted">none</li></ul>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+function bytes(n) {
+  let i = 0;
+  while (n >= 1024 && i < UNITS.length - 1) { n /= 1024; i++ }
+  return (i ? n.toFixed(1) : String(n)) + ' ' + UNITS[i];
+}
+const rate = n => bytes(n) + '/s';
+function item(text, cls) {
+  const li = document.createElement('li');
+  li.textContent = text;
+  if (cls) li.className = cls;
+  return li;
+}
+function row(cells) {
+  const tr = document.createElement('tr');
+  for (const c of cells) {
+    const td = document.createElement('td');
+    td.textContent = c;
+    tr.append(td);
+  }
+  return tr;
+}
+function emptyRow() {
+  const tr = document.createElement('tr');
+  const td = document.createElement('td');
+  td.colSpan = 5;
+  td.className = 'muted';
+  td.textContent = 'none';
+  tr.append(td);
+  return tr;
+}
+async function tick() {
+  let s;
+  try {
+    const r = await fetch('/_status.json', {cache: 'no-store'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    s = await r.json();
+  } catch (e) {
+    $('name').textContent = 'status unavailable: ' + e.message;
+    return;
+  }
+  const t = s.torrent, q = s.selfTest;
+  document.title = t.name + ' - torrent2webdav';
+  $('name').textContent = t.name;
+  $('hash').textContent = t.infohash;
+  $('bar').style.width = t.percent.toFixed(1) + '%';
+  $('progress').textContent = t.percent.toFixed(1) + '% - ' + bytes(t.cached) + ' / ' + bytes(t.size);
+  $('down').textContent = rate(s.transfer.down);
+  $('up').textContent = rate(s.transfer.up);
+  $('swarm').textContent = s.swarm.connected + ' / ' + s.swarm.total + ' peers';
+  $('swarm').title = s.swarm.seeders + ' seeders, ' + s.swarm.pending + ' pending, ' + s.swarm.halfOpen + ' half-open';
+  $('ip').textContent = q.publicIp || 'unknown';
+  $('port').textContent = q.port + ' ' + q.portStatus;
+  $('port').title = q.error || ('checked ' + (q.checked || 'not yet'));
+  $('listen').textContent = s.listeners.length ? 'listening on ' + s.listeners.join(', ') : '';
+  $('files').replaceChildren(...(s.openFiles.length
+    ? s.openFiles.map(f => item(f.name + (f.readers > 1 ? ' (' + f.readers + ' readers)' : '')))
+    : [item('none', 'muted')]));
+  $('peers').replaceChildren(...(s.peers.length
+    ? s.peers.map(p => row([p.addr, p.source, rate(p.down), rate(p.up), String(p.pieces)]))
+    : [emptyRow()]));
+  $('trackers').replaceChildren(...(s.trackers.length
+    ? s.trackers.map(u => item(u))
+    : [item('none', 'muted')]));
+}
+tick();
+setInterval(tick, 1000);
+</script>
+</body></html>
+`
