@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"log"
 	"log/slog"
+	"math"
 	"mime"
 	"net/http"
 	"os"
@@ -25,7 +26,7 @@ import (
 	"time"
 
 	"github.com/anacrolix/torrent"
-	"github.com/anacrolix/torrent/storage"
+	"github.com/anacrolix/torrent/metainfo"
 	"golang.org/x/net/webdav"
 )
 
@@ -43,26 +44,43 @@ const (
 func main() {
 	torrentFile := flag.String("torrent", env("TORRENT_FILE", ""), "path to the .torrent file (required)")
 	webdavAddr := flag.String("webdav-addr", env("WEBDAV_ADDR", ":8080"), "WebDAV listen address")
-	torrentPort := flag.Int("torrent-port", envInt("TORRENT_PORT", 42069), "BitTorrent TCP/UDP listen port")
+	portText := flag.String("torrent-port", resourceEnv("TORRENT_PORT", "42069"), "BitTorrent TCP/UDP listen port")
 	cacheDir := flag.String("cache-dir", env("CACHE_DIR", "./cache"), "directory for downloaded pieces")
-	cacheMax := flag.String("cache-max-size", env("CACHE_MAX_SIZE", "0"), "clear the cache above this size while idle (e.g. 50G; 0 = no limit)")
-	cacheTTL := flag.Duration("cache-ttl", envDuration("CACHE_TTL", 0), "clear the cache after this much idle time (e.g. 24h; 0 = never)")
+	cacheMax := flag.String("cache-max-size", resourceEnv("CACHE_MAX_SIZE", "0"), "clear the cache above this size while idle (e.g. 50G; 0 = no limit)")
+	ttlText := flag.String("cache-ttl", resourceEnv("CACHE_TTL", "0"), "clear the cache after this much idle time (e.g. 24h; 0 = never)")
 	user := flag.String("user", env("WEBDAV_USER", ""), "optional WebDAV basic-auth username")
 	pass := flag.String("pass", env("WEBDAV_PASS", ""), "optional WebDAV basic-auth password")
 	flag.Parse()
 
+	cacheTTL, err := parseDuration(*ttlText)
+	if err != nil {
+		log.Fatalf("cache-ttl: %v", err)
+	}
+
 	if *torrentFile == "" {
 		log.Fatal("no torrent: set TORRENT_FILE or -torrent")
+	}
+	// Checked before newStream: a half-configured pair must not reach the code
+	// that may wipe the cache.
+	if err := validateAuth(*user, *pass); err != nil {
+		log.Fatalf("auth: %v", err)
+	}
+	torrentPort, err := strconv.Atoi(*portText)
+	if err != nil {
+		log.Fatalf("torrent-port: %v", err)
+	}
+	if err := checkPort(torrentPort); err != nil {
+		log.Fatalf("torrent-port: %v", err)
 	}
 	maxBytes, err := parseSize(*cacheMax)
 	if err != nil {
 		log.Fatalf("cache-max-size: %v", err)
 	}
 
-	s := newStream(*torrentFile, *cacheDir, *torrentPort, maxBytes, *cacheTTL)
+	s := newStream(*torrentFile, *cacheDir, torrentPort, maxBytes, cacheTTL)
 	defer s.Close()
 
-	h := http.Handler(&webdav.Handler{
+	h := methodWrapper(&webdav.Handler{
 		Prefix:     "/",
 		FileSystem: s,
 		LockSystem: webdav.NewMemLS(),
@@ -71,25 +89,13 @@ func main() {
 		h = withBasicAuth(*user, *pass, h)
 	}
 
-	srv := &http.Server{
-		Addr:              *webdavAddr,
-		Handler:           h,
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-		// No WriteTimeout: a read can legitimately block until the swarm delivers data.
-	}
+	l := newHTTPLifecycle(h, shutdownGrace)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		srv.Shutdown(shutdownCtx)
-	}()
 
 	log.Printf("webdav on %s", *webdavAddr)
-	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+	if err := l.serve(ctx, *webdavAddr); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -101,30 +107,43 @@ func env(key, def string) string {
 	return def
 }
 
-func envInt(key string, def int) int {
-	if v, err := strconv.Atoi(os.Getenv(key)); err == nil {
+func resourceEnv(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok {
 		return v
 	}
 	return def
 }
 
-func envDuration(key string, def time.Duration) time.Duration {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	d, err := time.ParseDuration(v)
+// parseDuration rejects negative values and positive values that ParseDuration
+// truncates to zero (anything under a nanosecond).
+func parseDuration(s string) (time.Duration, error) {
+	d, err := time.ParseDuration(s)
 	if err != nil {
-		log.Fatalf("%s: %v", key, err)
+		return 0, err
 	}
-	return d
+	if d < 0 {
+		return 0, fmt.Errorf("negative duration %q", s)
+	}
+	if d == 0 && strings.ContainsAny(s, "123456789") {
+		return 0, fmt.Errorf("duration %q is less than one nanosecond", s)
+	}
+	return d, nil
+}
+
+// checkPort rejects ports outside the TCP/UDP range. Port 0 is rejected too:
+// it would silently pick a random port instead of the forwarded one configured.
+func checkPort(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("invalid port %d (want 1-65535)", port)
+	}
+	return nil
 }
 
 // parseSize parses "50G", "1.5GB", "20GiB", "500M" or a plain byte count.
 // Sizes are binary (G = GiB).
 func parseSize(s string) (int64, error) {
 	t := strings.ToUpper(strings.TrimSpace(s))
-	if t == "" || t == "0" {
+	if t == "0" {
 		return 0, nil
 	}
 	mult := int64(1)
@@ -145,10 +164,30 @@ func parseSize(s string) (int64, error) {
 		}
 	}
 	n, err := strconv.ParseFloat(t, 64)
-	if err != nil || n < 0 {
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n < 0 {
 		return 0, fmt.Errorf("invalid size %q", s)
 	}
+	if n >= float64(math.MaxInt64)/float64(mult) {
+		return 0, fmt.Errorf("size %q overflows int64", s)
+	}
+	if n == 0 && strings.ContainsAny(t, "123456789") {
+		// ParseFloat underflows very small positive values to zero.
+		return 0, fmt.Errorf("size %q is less than one byte", s)
+	}
+	if n > 0 && n*float64(mult) < 1 {
+		return 0, fmt.Errorf("size %q is less than one byte", s)
+	}
 	return int64(n * float64(mult)), nil
+}
+
+// validateAuth rejects a half-configured basic-auth pair. A lone user or
+// password is always a mistake: it would either serve unprotected or reject
+// every request, so refuse to start instead.
+func validateAuth(user, pass string) error {
+	if (user == "") != (pass == "") {
+		return errors.New("user and pass must be set together: set both WEBDAV_USER/-user and WEBDAV_PASS/-pass, or neither")
+	}
+	return nil
 }
 
 func withBasicAuth(user, pass string, h http.Handler) http.Handler {
@@ -168,11 +207,11 @@ func withBasicAuth(user, pass string, h http.Handler) http.Handler {
 // stream owns the torrent client, its cache, and the current WebDAV share, and
 // can reset all of them to enforce cache limits.
 type stream struct {
-	torrentFile string
-	cacheDir    string
-	port        int
-	maxBytes    int64
-	ttl         time.Duration
+	meta     *metainfo.MetaInfo // original metainfo, for a stable creation date across reopens
+	cacheDir string             // private managed directory under -cache-dir; safe to clear
+	port     int
+	maxBytes int64
+	ttl      time.Duration
 
 	mu       sync.Mutex
 	cond     *sync.Cond
@@ -181,7 +220,6 @@ type stream struct {
 	lastUsed time.Time
 
 	cl    *torrent.Client
-	st    storage.ClientImplCloser
 	t     *torrent.Torrent
 	share *share
 
@@ -191,26 +229,36 @@ type stream struct {
 }
 
 func newStream(torrentFile, cacheDir string, port int, maxBytes int64, ttl time.Duration) *stream {
+	mi, err := metainfo.LoadFromFile(torrentFile)
+	if err != nil {
+		log.Fatalf("load torrent: %v", err)
+	}
+	managedDir, err := prepareManagedCache(cacheDir)
+	if err != nil {
+		log.Fatal(err)
+	}
 	s := &stream{
-		torrentFile: torrentFile,
-		cacheDir:    cacheDir,
-		port:        port,
-		maxBytes:    maxBytes,
-		ttl:         ttl,
-		lastUsed:    time.Now(),
-		done:        make(chan struct{}),
-		loopDone:    make(chan struct{}),
+		meta:     mi,
+		cacheDir: managedDir,
+		port:     port,
+		maxBytes: maxBytes,
+		ttl:      ttl,
+		lastUsed: time.Now(),
+		done:     make(chan struct{}),
+		loopDone: make(chan struct{}),
 	}
 	s.cond = sync.NewCond(&s.mu)
 
-	if ttl > 0 && cacheIdleExpired(cacheDir, ttl) {
-		log.Printf("cache idle for over %s, clearing %s", ttl, cacheDir)
-		if err := os.RemoveAll(cacheDir); err != nil {
+	// Keep the TTL clock across restarts instead of granting a full new TTL.
+	if used, ok := cacheMarkerTime(s.cacheDir); ok {
+		s.lastUsed = used
+	}
+
+	if ttl > 0 && cacheIdleExpired(s.cacheDir, ttl) {
+		log.Printf("cache idle for over %s, clearing %s", ttl, filepath.Join(s.cacheDir, payloadDirName))
+		if err := wipeManagedPayload(s.cacheDir); err != nil {
 			log.Printf("clear cache: %v", err)
 		}
-	}
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		log.Fatal(err)
 	}
 	s.open()
 	go s.cleanLoop()
@@ -226,35 +274,31 @@ func (s *stream) open() {
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.ListenPort = s.port
 	cfg.Seed = false
-	st := storage.NewFile(s.cacheDir)
-	cfg.DefaultStorage = st // the client never closes storage it was given
+	cfg.DataDir = s.payloadDir()
+	if err := ensureRealDir(cfg.DataDir); err != nil {
+		log.Fatalf("cache payload: %v", err)
+	}
 	cfg.Slogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
-	cl, err := torrent.NewClient(cfg)
+	cl, err := torrent.NewClient(cfg) // owns and closes the storage in DataDir
 	if err != nil {
-		st.Close()
 		log.Fatalf("torrent client: %v", err)
 	}
-	t, err := cl.AddTorrentFromFile(s.torrentFile)
+	t, err := cl.AddTorrent(s.meta)
 	if err != nil {
 		cl.Close()
-		st.Close()
 		log.Fatalf("add torrent: %v", err)
 	}
 	<-t.GotInfo()
-	s.cl, s.st, s.t, s.share = cl, st, t, newShare(t)
+	s.cl, s.t, s.share = cl, t, newShare(t, s.meta.CreationDate)
 }
 
 func (s *stream) close() {
 	if s.cl != nil {
-		s.cl.Close() // flushes the piece-completion database
+		s.t.Drop()   // Finish pending piece checkpoints before the client closes their database.
+		s.cl.Close() // flushes the piece-completion database and closes storage
 	}
-	if s.st != nil {
-		if err := s.st.Close(); err != nil {
-			log.Printf("close storage: %v", err)
-		}
-	}
-	s.cl, s.st, s.t, s.share = nil, nil, nil, nil
+	s.cl, s.t, s.share = nil, nil, nil
 }
 
 func (s *stream) Close() {
@@ -297,6 +341,12 @@ func (s *stream) evictIfNeeded() {
 	case s.maxBytes > 0 && size > s.maxBytes:
 		reason = fmt.Sprintf("%d bytes cached, limit %d", size, s.maxBytes)
 	case s.ttl > 0 && time.Since(s.lastUsed) > s.ttl:
+		if size == 0 {
+			// Nothing cached: rebuilding the session would only reset the
+			// TTL clock without a read.
+			s.mu.Unlock()
+			return
+		}
 		reason = "idle for " + s.ttl.String()
 	default:
 		s.mu.Unlock()
@@ -307,11 +357,8 @@ func (s *stream) evictIfNeeded() {
 
 	log.Printf("clearing cache: %s", reason)
 	s.close()
-	if err := os.RemoveAll(s.cacheDir); err != nil {
+	if err := wipeManagedPayload(s.cacheDir); err != nil {
 		log.Printf("clear cache: %v", err)
-	}
-	if err := os.MkdirAll(s.cacheDir, 0o755); err != nil {
-		log.Fatalf("cache dir: %v", err)
 	}
 	s.open()
 
@@ -330,22 +377,26 @@ func (s *stream) persistLastUsed() {
 	s.mu.Lock()
 	used := s.lastUsed
 	s.mu.Unlock()
-	path := filepath.Join(s.cacheDir, cacheMarker)
-	if err := os.WriteFile(path, nil, 0o644); err != nil {
-		return
+	if err := writeCacheMarker(filepath.Join(s.cacheDir, cacheMarker), used); err != nil {
+		log.Printf("cache marker: %v", err)
 	}
-	_ = os.Chtimes(path, used, used)
 }
 
+// cacheIdleExpired reports whether a valid marker records more than ttl of
+// idleness. A missing or non-regular marker never expires: the payload may come
+// from an older version, and guessing would delete data we cannot identify.
 func cacheIdleExpired(cacheDir string, ttl time.Duration) bool {
-	fi, err := os.Stat(filepath.Join(cacheDir, cacheMarker))
-	if err != nil {
-		// No record of use. Empty/no cache is fine; old data without a marker
-		// is treated as expired.
-		entries, _ := os.ReadDir(cacheDir)
-		return len(entries) > 0
+	used, ok := cacheMarkerTime(cacheDir)
+	return ok && time.Since(used) > ttl
+}
+
+// cacheMarkerTime returns the last-use time recorded by a regular marker file.
+func cacheMarkerTime(cacheDir string) (time.Time, bool) {
+	fi, err := os.Lstat(filepath.Join(cacheDir, cacheMarker))
+	if err != nil || !fi.Mode().IsRegular() {
+		return time.Time{}, false
 	}
-	return time.Since(fi.ModTime()) > ttl
+	return fi.ModTime(), true
 }
 
 func (s *stream) touch() {
@@ -430,10 +481,10 @@ type share struct {
 	root *entry
 }
 
-func newShare(t *torrent.Torrent) *share {
+func newShare(t *torrent.Torrent, created int64) *share {
 	// Stable modtime (torrent creation date, or the epoch) so clients don't
 	// treat files as changed on every container restart.
-	mod := time.Unix(t.Metainfo().CreationDate, 0)
+	mod := time.Unix(created, 0)
 	root := &entry{name: t.Name(), dir: true, modTime: mod, kids: map[string]*entry{}}
 	for _, f := range t.Files() {
 		// x/net/webdav sniffs unknown extensions for the getcontenttype property

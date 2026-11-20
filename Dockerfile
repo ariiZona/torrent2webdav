@@ -1,8 +1,9 @@
 FROM golang:1.27-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
-COPY main.go ./
+RUN go mod download && go mod verify
+COPY *.go ./
+RUN CGO_ENABLED=0 go test ./...
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/torrent2webdav .
 
 FROM alpine:3.22

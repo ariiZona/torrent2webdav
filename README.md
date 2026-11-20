@@ -36,14 +36,16 @@ Flags and environment variables are equivalent.
 | `-torrent` | `TORRENT_FILE` | *(required)* | Path to the `.torrent` file |
 | `-webdav-addr` | `WEBDAV_ADDR` | `:8080` | WebDAV listen address |
 | `-torrent-port` | `TORRENT_PORT` | `42069` | BitTorrent TCP + UDP listen port |
-| `-cache-dir` | `CACHE_DIR` | `./cache` | Where downloaded pieces are stored |
+| `-cache-dir` | `CACHE_DIR` | `./cache` | Parent directory for the app's private cache |
 | `-cache-max-size` | `CACHE_MAX_SIZE` | `0` | Clear the cache above this size while idle (`50G`, `1.5TB`, bytes; `0` = no limit) |
 | `-cache-ttl` | `CACHE_TTL` | `0` | Clear the cache after this much idle time (`30m`, `24h`, `168h`; `0` = never) |
 | `-user` | `WEBDAV_USER` | *(empty)* | Enable HTTP basic auth with this user |
 | `-pass` | `WEBDAV_PASS` | *(empty)* | Password for basic auth |
 
 To change the WebDAV port, change `WEBDAV_ADDR` and the container port
-mapping together.
+mapping together. `WEBDAV_USER` and `WEBDAV_PASS` must be set together (or both
+left empty): a lone username or password stops the app at startup instead of
+serving an unprotected share.
 
 ## Mount on the client (rclone)
 
@@ -55,9 +57,35 @@ rclone mount t2w: /mnt/torrent \
   --dir-cache-time 1h
 ```
 
-With auth enabled, add `user=... pass=$(rclone obscure 'secret')` to
-`rclone config create`. `--vfs-cache-mode full` is what gives you local
-caching, background prefetch, and seeking without re-downloading.
+`--vfs-cache-mode full` is what gives you local caching, background prefetch,
+and seeking without re-downloading.
+
+### Auth
+
+With `WEBDAV_USER` / `WEBDAV_PASS` set, add the credentials:
+
+```sh
+rclone config create t2w webdav url https://DOCKER_HOST/ vendor other \
+  user YOUR_USER pass $(rclone obscure 'YOUR_PASS')
+```
+
+Basic auth sends the password in cleartext, so use it over TLS only.
+
+### LAN and TLS
+
+The Compose file publishes WebDAV on `127.0.0.1:8080`, so only the Docker host
+can reach it by default. To mount it from another machine:
+
+- **Reverse proxy with TLS (recommended).** Keep the localhost binding and put
+  Caddy, nginx or Traefik in front with a certificate; point rclone at the
+  proxy's `https://` URL. Enable basic auth as well if the proxy does not
+  authenticate for you.
+- **Trusted LAN without TLS.** Change the mapping to `"8080:8080/tcp"` (or bind
+  a specific host IP) and enable basic auth. The password crosses the network in
+  the clear, so only do this on a network you trust.
+
+Running without Docker, the binary listens on `:8080` (all interfaces) by
+default; pass `-webdav-addr 127.0.0.1:8080` to restrict it the same way.
 
 ## What the share looks like
 
@@ -82,7 +110,7 @@ never change, so clients don't re-download on every container restart.
 
 `CACHE_MAX_SIZE` and `CACHE_TTL` are enforced about once a minute, and only
 while the share is idle: no file open, and no read in the last minute. Both
-policies evict the **whole** cache and restart the torrent session; the share
+policies evict managed torrent data and restart the torrent session; the share
 stays available and the next read downloads from the swarm again.
 
 That coarse granularity is deliberate: torrent data is stored in whole files
@@ -92,9 +120,11 @@ reader may still touch them is not safe. So:
 - The cache can grow past `CACHE_MAX_SIZE` during a long stream; eviction waits
   until you stop. Set the limit at least as large as the biggest file you plan
   to watch, or leave it unlimited and rely on rclone's cache.
-- `CACHE_TTL` also counts idle time while the container is stopped: the last-use
-  timestamp is kept in `$CACHE_DIR/.last-used`, so a restart does not reset the
-  clock.
+- `CACHE_TTL` also counts idle time while the container is stopped. The last-use
+  timestamp lives outside the torrent payload so torrent filenames can't collide with it.
+- **Upgrading an existing cache:** the app starts a new managed cache beneath
+  `CACHE_DIR`. Legacy files and unrelated siblings are left in place. After checking
+  the new mount, remove old downloads manually if you need the space.
 - Size is the bytes downloaded for the current torrent. If you reuse one cache
   directory across different torrents, old torrents' data still occupies disk
   until the TTL clears the directory; a dedicated cache dir per torrent is
@@ -146,11 +176,12 @@ after an eviction; the working set normally lives in rclone's own cache.
 
 ## Limits
 
-- One torrent per container. To switch, change `TORRENT_FILE` and restart; the
-  cache can be reused.
+- One torrent per container. To switch, change `TORRENT_FILE` and restart.
+  Each torrent has its own payload directory, keyed by its metadata hash.
 - No magnet links or multiple torrents — both are small additions around
   `Client.AddTorrent` if you need them.
-- No auth unless `WEBDAV_USER` is set. Don't expose the port publicly without it.
+- Auth is off unless both `WEBDAV_USER` and `WEBDAV_PASS` are set. Don't
+  expose the port beyond localhost without auth, and use TLS when you do.
 - Reads block until the swarm delivers the requested pieces; there is no
   timeout on the WebDAV side by design.
 - Seeding is disabled: the container uploads only incidentally while
@@ -165,6 +196,6 @@ after an eviction; the working set normally lives in rclone's own cache.
 go test ./...
 ```
 
-The test builds a real torrent, seeds it from a second local client, and checks
-the WebDAV listing, a full stream, a range read in the middle of a file, a
-nested directory, and that writes are rejected.
+The image build also runs the tests. A local seeder supplies real pieces so
+the streaming test can check a cold range read, a full stream, and a nested
+directory without depending on a public swarm.

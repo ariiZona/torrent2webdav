@@ -40,11 +40,11 @@ func TestShareStreamsFromSwarm(t *testing.T) {
 	<-st.GotInfo()
 	must(t, st.VerifyDataContext(t.Context()))
 
-	srv := httptest.NewServer(&webdav.Handler{
+	srv := httptest.NewServer(methodWrapper(&webdav.Handler{
 		Prefix:     "/",
-		FileSystem: newShare(dlt),
+		FileSystem: newShare(dlt, mi.CreationDate),
 		LockSystem: webdav.NewMemLS(),
-	})
+	}))
 	defer srv.Close()
 	client := &http.Client{Timeout: 60 * time.Second}
 
@@ -58,23 +58,27 @@ func TestShareStreamsFromSwarm(t *testing.T) {
 		}
 	}
 
-	// A reader is what creates download demand, so start streaming first and
-	// only then connect the peer.
+	// The cache is still cold here. A ranged read must fetch the requested
+	// bytes without starting from the beginning of the file.
+	if got := dlt.BytesCompleted(); got != 0 {
+		t.Fatalf("%d bytes cached before any read", got)
+	}
+	const rangeStart, rangeEnd = 1048576, 1048599
 	streamed := make(chan []byte, 1)
 	go func() {
-		b, err := doGet(client, srv.URL+"/big.t2wsmoke", "")
+		b, err := doGet(client, srv.URL+"/big.t2wsmoke", fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd))
 		if err != nil {
 			t.Error(err)
 		}
 		streamed <- b
 	}()
 	waitForPeer(t, dlt, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: seeder.LocalPort()})
-	if got := <-streamed; !bytes.Equal(got, content) {
-		t.Fatalf("full read differs (%d bytes)", len(got))
+	want := content[rangeStart : rangeEnd+1]
+	if got := <-streamed; !bytes.Equal(got, want) {
+		t.Fatalf("cold ranged read differs: got %d bytes, want %d", len(got), len(want))
 	}
-	got := get(t, client, srv.URL+"/big.t2wsmoke", "bytes=1048576-1048599")
-	if !bytes.Equal(got, content[1048576:1048600]) {
-		t.Fatal("ranged read differs")
+	if got := get(t, client, srv.URL+"/big.t2wsmoke", ""); !bytes.Equal(got, content) {
+		t.Fatalf("full read differs (%d bytes)", len(got))
 	}
 	if got := get(t, client, srv.URL+"/sub/small.txt", ""); string(got) != testSmallText {
 		t.Fatalf("small.txt = %q", got)
@@ -85,8 +89,11 @@ func TestShareStreamsFromSwarm(t *testing.T) {
 	res, err := client.Do(req)
 	must(t, err)
 	res.Body.Close()
-	if res.StatusCode < 400 {
-		t.Errorf("PUT status = %d, want a 4xx", res.StatusCode)
+	if res.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("PUT status = %d, want %d", res.StatusCode, http.StatusMethodNotAllowed)
+	}
+	if got := res.Header.Get("Allow"); got != allowHeader {
+		t.Errorf("PUT Allow = %q, want %q", got, allowHeader)
 	}
 }
 
@@ -125,6 +132,11 @@ func TestCacheEvictionAndRestart(t *testing.T) {
 	if got := getFile(); !bytes.Equal(got, content) {
 		t.Fatalf("full read differs (%d bytes)", len(got))
 	}
+	before, err := s.Stat(t.Context(), "")
+	must(t, err)
+	if want := time.Unix(mi.CreationDate, 0); !before.ModTime().Equal(want) {
+		t.Fatalf("modtime before eviction = %v, want %v", before.ModTime(), want)
+	}
 
 	waitIdle(t, s)
 	s.mu.Lock()
@@ -142,6 +154,11 @@ func TestCacheEvictionAndRestart(t *testing.T) {
 	if got := getFile(); !bytes.Equal(got, content) {
 		t.Fatalf("read after eviction differs (%d bytes)", len(got))
 	}
+	after, err := s.Stat(t.Context(), "")
+	must(t, err)
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("modtime changed across eviction: %v -> %v", before.ModTime(), after.ModTime())
+	}
 }
 
 func TestCacheIdleExpired(t *testing.T) {
@@ -150,11 +167,11 @@ func TestCacheIdleExpired(t *testing.T) {
 		t.Fatal("empty cache treated as expired")
 	}
 	must(t, os.WriteFile(filepath.Join(dir, "data"), nil, 0o644))
-	if !cacheIdleExpired(dir, time.Hour) {
-		t.Fatal("unmarked cache data not treated as expired")
+	if cacheIdleExpired(dir, time.Hour) {
+		t.Fatal("cache without a marker treated as expired")
 	}
 	marker := filepath.Join(dir, cacheMarker)
-	must(t, os.WriteFile(marker, nil, 0o644))
+	must(t, writeCacheMarker(marker, time.Now()))
 	if cacheIdleExpired(dir, time.Hour) {
 		t.Fatal("fresh cache treated as expired")
 	}
@@ -162,6 +179,99 @@ func TestCacheIdleExpired(t *testing.T) {
 	_ = os.Chtimes(marker, old, old)
 	if !cacheIdleExpired(dir, time.Hour) {
 		t.Fatal("old cache not treated as expired")
+	}
+	// Only a regular file is a valid record.
+	must(t, os.Remove(marker))
+	must(t, os.Mkdir(marker, 0o755))
+	if cacheIdleExpired(dir, time.Hour) {
+		t.Fatal("directory marker treated as expired")
+	}
+}
+
+// A restart must continue the idle timer from the persisted marker.
+func TestCacheTTLAcrossRestart(t *testing.T) {
+	_, torrentPath, _, _ := makeTorrent(t)
+	root := t.TempDir()
+	managed, err := prepareManagedCache(root)
+	must(t, err)
+	payloadFile := filepath.Join(managed, payloadDirName, "cached")
+	must(t, os.WriteFile(payloadFile, []byte("data"), 0o644))
+
+	const ttl = time.Hour
+	const idle = 45 * time.Minute
+	must(t, writeCacheMarker(filepath.Join(managed, cacheMarker), time.Now().Add(-idle)))
+
+	s := newStream(torrentPath, root, 0, 0, ttl)
+	t.Cleanup(s.Close)
+
+	if _, err := os.Stat(payloadFile); err != nil {
+		t.Fatalf("payload cleared with TTL remaining: %v", err)
+	}
+	remaining := time.Until(s.lastUsed.Add(ttl))
+	want := ttl - idle
+	if remaining < want-2*time.Minute || remaining > want+2*time.Minute {
+		t.Fatalf("remaining TTL = %v, want about %v", remaining, want)
+	}
+}
+
+// A payload without a marker predates this version: never delete it on a guess.
+func TestCacheTTLMissingMarkerKeepsPayload(t *testing.T) {
+	_, torrentPath, _, _ := makeTorrent(t)
+	root := t.TempDir()
+	managed, err := prepareManagedCache(root)
+	must(t, err)
+	payloadFile := filepath.Join(managed, payloadDirName, "cached")
+	must(t, os.WriteFile(payloadFile, []byte("data"), 0o644))
+
+	s := newStream(torrentPath, root, 0, 0, time.Hour)
+	t.Cleanup(s.Close)
+	if _, err := os.Stat(payloadFile); err != nil {
+		t.Fatalf("unmarked payload cleared: %v", err)
+	}
+}
+
+// An old marker still clears the payload at startup.
+func TestCacheTTLExpiredMarkerClearsPayload(t *testing.T) {
+	_, torrentPath, _, _ := makeTorrent(t)
+	root := t.TempDir()
+	managed, err := prepareManagedCache(root)
+	must(t, err)
+	payloadFile := filepath.Join(managed, payloadDirName, "cached")
+	must(t, os.WriteFile(payloadFile, []byte("data"), 0o644))
+	must(t, writeCacheMarker(filepath.Join(managed, cacheMarker), time.Now().Add(-2*time.Hour)))
+
+	s := newStream(torrentPath, root, 0, 0, time.Hour)
+	t.Cleanup(s.Close)
+	if _, err := os.Stat(payloadFile); !os.IsNotExist(err) {
+		t.Fatalf("expired payload survived: %v", err)
+	}
+}
+
+// The timer must not restart the torrent client, or refresh the TTL, when the
+// payload is already empty.
+func TestCacheTTLSkipsEmptyPayload(t *testing.T) {
+	_, torrentPath, _, _ := makeTorrent(t)
+	s := newStream(torrentPath, t.TempDir(), 0, 0, time.Hour)
+	t.Cleanup(s.Close)
+	if got := s.t.BytesCompleted(); got != 0 {
+		t.Fatalf("%d bytes cached before any read", got)
+	}
+
+	s.mu.Lock()
+	s.lastUsed = time.Now().Add(-2 * time.Hour)
+	oldUsed, before := s.lastUsed, s.t
+	s.mu.Unlock()
+
+	s.evictIfNeeded()
+
+	s.mu.Lock()
+	gotUsed := s.lastUsed
+	s.mu.Unlock()
+	if s.t != before {
+		t.Fatal("empty session was rebuilt")
+	}
+	if !gotUsed.Equal(oldUsed) {
+		t.Fatalf("TTL reset on empty payload: %v -> %v", oldUsed, gotUsed)
 	}
 }
 
@@ -171,7 +281,6 @@ func TestParseSize(t *testing.T) {
 		want int64
 	}{
 		{"0", 0},
-		{"", 0},
 		{"4096", 4096},
 		{"1K", 1 << 10},
 		{"1.5M", 1572864},
@@ -179,6 +288,7 @@ func TestParseSize(t *testing.T) {
 		{"2GiB", 2 << 30},
 		{"1TB", 1 << 40},
 		{"10 B", 10},
+		{"0.5K", 512},
 	}
 	for _, tc := range ok {
 		got, err := parseSize(tc.in)
@@ -186,10 +296,101 @@ func TestParseSize(t *testing.T) {
 			t.Errorf("parseSize(%q) = %d, %v; want %d", tc.in, got, err, tc.want)
 		}
 	}
-	for _, bad := range []string{"x", "-1G", "G", "1EB"} {
+	for _, bad := range []string{
+		"x", "-1G", "G", "1EB",
+		"NaN", "Inf", "-Inf", "1e999",
+		"0.5", "0.5B", "1e-400", "1e-400G",
+		"9223372036854775808", "9000000000000000000G",
+	} {
 		if _, err := parseSize(bad); err == nil {
 			t.Errorf("parseSize(%q) unexpectedly succeeded", bad)
 		}
+	}
+}
+
+func TestParseDuration(t *testing.T) {
+	ok := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"0", 0},
+		{"0s", 0},
+		{"30m", 30 * time.Minute},
+		{"1.5h", 90 * time.Minute},
+		{"24h", 24 * time.Hour},
+	}
+	for _, tc := range ok {
+		got, err := parseDuration(tc.in)
+		if err != nil || got != tc.want {
+			t.Errorf("parseDuration(%q) = %s, %v; want %s", tc.in, got, err, tc.want)
+		}
+	}
+	for _, bad := range []string{
+		"x", "-1h", "0.5ns", "+0.4ns", "0.0000000001s",
+		"NaN", "Inf", "9999999999999999999h",
+	} {
+		if _, err := parseDuration(bad); err == nil {
+			t.Errorf("parseDuration(%q) unexpectedly succeeded", bad)
+		}
+	}
+}
+
+func TestCheckPort(t *testing.T) {
+	for _, port := range []int{1, 80, 42069, 65535} {
+		if err := checkPort(port); err != nil {
+			t.Errorf("checkPort(%d) = %v; want nil", port, err)
+		}
+	}
+	for _, port := range []int{-1, 0, 65536} {
+		if err := checkPort(port); err == nil {
+			t.Errorf("checkPort(%d) unexpectedly succeeded", port)
+		}
+	}
+}
+
+func TestValidateAuth(t *testing.T) {
+	for _, tc := range []struct {
+		user, pass string
+		wantErr    bool
+	}{
+		{"", "", false},
+		{"u", "p", false},
+		{"u", "", true},
+		{"", "p", true},
+	} {
+		if err := validateAuth(tc.user, tc.pass); (err != nil) != tc.wantErr {
+			t.Errorf("validateAuth(%q, %q) = %v, wantErr %v", tc.user, tc.pass, err, tc.wantErr)
+		}
+	}
+}
+
+// With auth enabled, an anonymous request must be challenged, and the right
+// credentials must still reach the handler.
+func TestBasicAuthRejectsAnonymous(t *testing.T) {
+	h := withBasicAuth("u", "p", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL)
+	must(t, err)
+	res.Body.Close()
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("anonymous status = %d, want 401", res.StatusCode)
+	}
+	if res.Header.Get("WWW-Authenticate") == "" {
+		t.Error("missing WWW-Authenticate challenge")
+	}
+
+	req, err := http.NewRequest("GET", srv.URL, nil)
+	must(t, err)
+	req.SetBasicAuth("u", "p")
+	res, err = http.DefaultClient.Do(req)
+	must(t, err)
+	res.Body.Close()
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("authenticated status = %d, want 204", res.StatusCode)
 	}
 }
 
@@ -209,7 +410,7 @@ func makeTorrent(t *testing.T) (mi *metainfo.MetaInfo, torrentPath, dataRoot str
 	must(t, info.BuildFromFilePath(dataDir))
 	infoBytes, err := bencode.Marshal(info)
 	must(t, err)
-	mi = &metainfo.MetaInfo{InfoBytes: infoBytes}
+	mi = &metainfo.MetaInfo{InfoBytes: infoBytes, CreationDate: 1700000000}
 
 	torrentPath = filepath.Join(t.TempDir(), "smoke.torrent")
 	f, err := os.Create(torrentPath)
@@ -279,8 +480,16 @@ func doGet(c *http.Client, url, rng string) ([]byte, error) {
 		return nil, err
 	}
 	defer res.Body.Close()
-	if rng != "" && res.StatusCode != http.StatusPartialContent {
-		return nil, fmt.Errorf("range status = %d", res.StatusCode)
+	if rng != "" {
+		if res.StatusCode != http.StatusPartialContent {
+			return nil, fmt.Errorf("range status = %d", res.StatusCode)
+		}
+		// A partial response must start exactly at the requested offset, not at
+		// the start of the file.
+		rangeSpec := strings.TrimPrefix(rng, "bytes=")
+		if cr := res.Header.Get("Content-Range"); !strings.HasPrefix(cr, "bytes "+rangeSpec+"/") {
+			return nil, fmt.Errorf("Content-Range = %q for %q", cr, rng)
+		}
 	}
 	return io.ReadAll(res.Body)
 }
