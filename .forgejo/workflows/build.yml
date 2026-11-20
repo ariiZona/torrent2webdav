@@ -1,0 +1,19 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  docker-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build --tag torrent2webdav:${{ github.sha }} .
+
+      - name: Show image
+        run: docker image inspect --format '{{.Id}} ({{.Size}} bytes)' torrent2webdav:${{ github.sha }}
