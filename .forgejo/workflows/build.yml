@@ -1,80 +1,41 @@
-name: build
+name: image
 
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
-    inputs:
-      debug:
-        description: "Run network/docker diagnostics"
-        type: boolean
-        default: false
 
 env:
   IMAGE_NAME: torrent2webdav
 
 jobs:
-  docker-image:
+  image:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # Registry host = Forgejo ROOT_URL without scheme; owner must be lowercase.
-      - name: Compute image coordinates
+      - name: Set image name
         run: |
           REGISTRY=$(echo "${{ github.server_url }}" | sed -E 's#^https?://##; s#/$##')
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          IMAGE="$REGISTRY/$OWNER/$IMAGE_NAME"
           echo "REGISTRY=$REGISTRY" >> "$GITHUB_ENV"
-          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
-          echo "Image: $IMAGE"
+          echo "IMAGE=$REGISTRY/$OWNER/$IMAGE_NAME" >> "$GITHUB_ENV"
 
-      # Always runs on manual dispatch with debug=true; never fails the job.
-      - name: Debug - environment & network
-        if: ${{ inputs.debug }}
-        continue-on-error: true
-        run: |
-          set -x
-          echo "DOCKER_HOST=$DOCKER_HOST"
-          echo "server_url=${{ github.server_url }}  registry=$REGISTRY  image=$IMAGE"
-          cat /etc/resolv.conf
-          docker version
-          docker info
-          docker network ls
-          echo "--- inner bridge network ---"
-          docker run --rm alpine cat /etc/resolv.conf
-          docker run --rm alpine ping -c1 -W2 1.1.1.1      || echo "!!! NO IP CONNECTIVITY on inner bridge"
-          docker run --rm alpine nslookup dl-cdn.alpinelinux.org || echo "!!! NO DNS on inner bridge"
-          echo "--- host network (DinD netns) ---"
-          docker run --rm --network host alpine nslookup dl-cdn.alpinelinux.org || echo "!!! NO DNS on host net"
-          docker run --rm --network host alpine wget -q --spider "https://$REGISTRY/v2/" ; echo "registry /v2/ exit=$? (401 auth-required is OK)"
-
-      - name: Build image
+      - name: Build
+        # Host networking: some runner Docker bridges have no DNS.
         run: |
           docker build --network host \
             --tag "$IMAGE:${{ github.sha }}" \
             --tag "$IMAGE:latest" \
             .
 
-      - name: Show image
-        run: docker image inspect --format '{{.Id}} ({{.Size}} bytes)' "$IMAGE:${{ github.sha }}"
-
-      # Publish only on pushes to main (not PRs).
-      - name: Log in to Forgejo registry
+      - name: Log in
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: echo "${{ secrets.REGISTRY_TOKEN }}" | docker login "$REGISTRY" -u "${{ secrets.REGISTRY_USER }}" --password-stdin
 
-      - name: Push image
+      - name: Push
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           docker push "$IMAGE:${{ github.sha }}"
           docker push "$IMAGE:latest"
-
-      - name: Debug - on failure
-        if: ${{ failure() }}
-        continue-on-error: true
-        run: |
-          docker info || true
-          docker images || true
-          docker run --rm alpine ping -c1 -W2 1.1.1.1 || echo "!!! NO IP CONNECTIVITY on inner bridge"
