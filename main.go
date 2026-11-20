@@ -37,6 +37,9 @@ const (
 	// Cache eviction only runs after this much time without a read, so a paused
 	// player or a gap between episodes doesn't throw the cache away.
 	evictIdle = time.Minute
+	// While idle, refresh the torrent's DHT entry so the next read starts from a
+	// known peer pool instead of bootstrapping again.
+	warmEvery = 15 * time.Minute
 	// Records when cached data was last read, so CACHE_TTL also works across restarts.
 	cacheMarker = ".last-used"
 )
@@ -235,6 +238,8 @@ type stream struct {
 
 	done      chan struct{}
 	loopDone  chan struct{}
+	warmStop  chan struct{}
+	warmDone  chan struct{}
 	closeOnce sync.Once
 }
 
@@ -285,6 +290,10 @@ func (s *stream) open() {
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.ListenPort = s.port
 	cfg.Seed = false
+	// DHT and PEX are enabled by NewDefaultClientConfig. Accept peers even while
+	// nothing is being read, so an idle share keeps its connections for the next
+	// play instead of only accepting peers once data is wanted.
+	cfg.AlwaysWantConns = true
 	cfg.DataDir = s.payloadDir()
 	if err := ensureRealDir(cfg.DataDir); err != nil {
 		log.Fatalf("cache payload: %v", err)
@@ -302,14 +311,72 @@ func (s *stream) open() {
 	}
 	<-t.GotInfo()
 	s.cl, s.t, s.share = cl, t, newShare(t, s.meta.CreationDate)
+	s.warmStop = make(chan struct{})
+	s.warmDone = make(chan struct{})
+	go func() {
+		defer close(s.warmDone)
+		s.keepWarm(s.warmStop, cl, t)
+	}()
 }
 
 func (s *stream) close() {
+	if s.warmStop != nil {
+		close(s.warmStop)
+		<-s.warmDone
+		s.warmStop, s.warmDone = nil, nil
+	}
 	if s.cl != nil {
 		s.t.Drop()   // Finish pending piece checkpoints before the client closes their database.
 		s.cl.Close() // flushes the piece-completion database and closes storage
 	}
 	s.cl, s.t, s.share = nil, nil, nil
+}
+
+// keepWarm refreshes the DHT entry while the share is idle. The library's own
+// announcer parks until data is wanted, so peers would otherwise forget us
+// between plays.
+func (s *stream) keepWarm(stop <-chan struct{}, cl *torrent.Client, t *torrent.Torrent) {
+	if !waitOrStop(stop, evictIdle) {
+		return
+	}
+	for {
+		if s.idle() {
+			for _, srv := range cl.DhtServers() {
+				annDone, annStop, err := t.AnnounceToDht(srv)
+				if err != nil {
+					continue
+				}
+				select {
+				case <-stop:
+					annStop()
+					return
+				case <-annDone:
+				case <-time.After(warmEvery):
+					annStop()
+				}
+			}
+		}
+		if !waitOrStop(stop, warmEvery) {
+			return
+		}
+	}
+}
+
+func (s *stream) idle() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.active == 0 && !s.wiping
+}
+
+func waitOrStop(stop <-chan struct{}, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-stop:
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (s *stream) Close() {

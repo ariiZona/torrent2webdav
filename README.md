@@ -200,6 +200,9 @@ after an eviction; the working set normally lives in rclone's own cache.
 - Inbound peers matter most. On Linux use `network_mode: host`, or forward the
   `TORRENT_PORT` TCP *and* UDP ports on your router. Without inbound
   connectivity you still download, just from fewer peers.
+- DHT, PEX and trackers are enabled. While the share is idle it refreshes its
+  DHT entry every 15 minutes and accepts inbound peers, so the next read starts
+  with a warm peer pool instead of bootstrapping from scratch.
 - The server cache (`/cache`) grows with everything that has been read, up to
   the torrent size. It is kept across restarts (piece completion is persisted).
   Bound it with `CACHE_MAX_SIZE` / `CACHE_TTL` (see above) or delete the
