@@ -68,6 +68,7 @@ Flags and environment variables are equivalent.
 | `-cache-dir` | `CACHE_DIR` | `./cache` | Parent directory for the app's private cache |
 | `-cache-max-size` | `CACHE_MAX_SIZE` | `0` | Clear the cache above this size while idle (`50G`, `1.5TB`, bytes; `0` = no limit) |
 | `-cache-ttl` | `CACHE_TTL` | `0` | Clear the cache after this much idle time (`30m`, `24h`, `168h`; `0` = never) |
+| `-upload-rate` | `UPLOAD_RATE` | `0` | Max upload speed to peers (`1M`, `500K`; bytes/s; `0` = unlimited) |
 | `-user` | `WEBDAV_USER` | *(empty)* | Enable HTTP basic auth with this user |
 | `-pass` | `WEBDAV_PASS` | *(empty)* | Password for basic auth |
 
@@ -219,8 +220,10 @@ after an eviction; the working set normally lives in rclone's own cache.
   expose the port beyond localhost without auth, and use TLS when you do.
 - Reads block until the swarm delivers the requested pieces; there is no
   timeout on the WebDAV side by design.
-- Seeding is disabled: the container uploads only incidentally while
-  downloading.
+- Seeding is enabled: the container uploads cached pieces to peers, including
+  while nothing is being read. It only downloads pieces requested through
+  WebDAV, so it never fetches the whole torrent just to seed it. Cap the upload
+  bandwidth with `UPLOAD_RATE` if needed.
 - Files without an extension can still make PROPFIND read 512 bytes for MIME
   sniffing (and thus wait for the swarm). Everything with an extension lists
   instantly.

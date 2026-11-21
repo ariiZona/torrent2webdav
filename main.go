@@ -29,6 +29,7 @@ import (
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/version"
 	"golang.org/x/net/webdav"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -52,6 +53,7 @@ func main() {
 	cacheDir := flag.String("cache-dir", env("CACHE_DIR", "./cache"), "directory for downloaded pieces")
 	cacheMax := flag.String("cache-max-size", resourceEnv("CACHE_MAX_SIZE", "0"), "clear the cache above this size while idle (e.g. 50G; 0 = no limit)")
 	ttlText := flag.String("cache-ttl", resourceEnv("CACHE_TTL", "0"), "clear the cache after this much idle time (e.g. 24h; 0 = never)")
+	uploadRateText := flag.String("upload-rate", resourceEnv("UPLOAD_RATE", "0"), "max upload speed to peers (e.g. 1M; 0 = unlimited)")
 	user := flag.String("user", env("WEBDAV_USER", ""), "optional WebDAV basic-auth username")
 	pass := flag.String("pass", env("WEBDAV_PASS", ""), "optional WebDAV basic-auth password")
 	flag.Parse()
@@ -80,8 +82,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("cache-max-size: %v", err)
 	}
+	uploadRate, err := parseSize(*uploadRateText)
+	if err != nil {
+		log.Fatalf("upload-rate: %v", err)
+	}
 
-	s := newStream(*torrentFile, *cacheDir, torrentPort, maxBytes, cacheTTL)
+	s := newStream(*torrentFile, *cacheDir, torrentPort, maxBytes, cacheTTL, uploadRate)
 	defer s.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -225,6 +231,7 @@ type stream struct {
 	port     int
 	maxBytes int64
 	ttl      time.Duration
+	upload   int64 // bytes per second; 0 = unlimited
 
 	mu       sync.Mutex
 	cond     *sync.Cond
@@ -244,7 +251,7 @@ type stream struct {
 	closeOnce sync.Once
 }
 
-func newStream(torrentFile, cacheDir string, port int, maxBytes int64, ttl time.Duration) *stream {
+func newStream(torrentFile, cacheDir string, port int, maxBytes int64, ttl time.Duration, upload int64) *stream {
 	mi, err := metainfo.LoadFromFile(torrentFile)
 	if err != nil {
 		log.Fatalf("load torrent: %v", err)
@@ -259,6 +266,7 @@ func newStream(torrentFile, cacheDir string, port int, maxBytes int64, ttl time.
 		port:     port,
 		maxBytes: maxBytes,
 		ttl:      ttl,
+		upload:   upload,
 		files:    map[string]int{},
 		lastUsed: time.Now(),
 		done:     make(chan struct{}),
@@ -296,7 +304,10 @@ func clientName() string {
 func (s *stream) open() {
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.ListenPort = s.port
-	cfg.Seed = false
+	cfg.Seed = true // upload cached pieces to peers, not only while downloading
+	if s.upload > 0 {
+		cfg.UploadRateLimiter = rate.NewLimiter(rate.Limit(s.upload), 0)
+	}
 	// Report the torrent library, not this app: the library's default name is
 	// derived from this module's path.
 	name := clientName()

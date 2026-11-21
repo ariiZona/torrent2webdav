@@ -19,6 +19,7 @@ services:
       TORRENT_PORT: "${TORRENT_PORT:-42069}"
       # CACHE_MAX_SIZE: 50G
       # CACHE_TTL: 24h
+      # UPLOAD_RATE: 1M
       # WEBDAV_USER: rclone
       # WEBDAV_PASS: change-me
       # Change the container port here AND in the ports mapping above.
