@@ -44,6 +44,9 @@ li { word-break: break-all }
 </div>
 <div class="muted" id="listen" style="margin-top:.5rem"></div>
 <h2>Open files</h2><ul id="files"><li class="muted">none</li></ul>
+<h2>Cached files</h2>
+<table><thead><tr><th>File</th><th>Cached</th><th>Size</th></tr></thead>
+<tbody id="cached"><tr><td colspan="3" class="muted">none</td></tr></tbody></table>
 <h2>Peers</h2>
 <table><thead><tr><th>Address</th><th>Source</th><th>Down</th><th>Up</th><th>Pieces</th></tr></thead>
 <tbody id="peers"><tr><td colspan="5" class="muted">none</td></tr></tbody></table>
@@ -73,14 +76,18 @@ function row(cells) {
   }
   return tr;
 }
-function emptyRow() {
+function emptyRow(cols) {
   const tr = document.createElement('tr');
   const td = document.createElement('td');
-  td.colSpan = 5;
+  td.colSpan = cols;
   td.className = 'muted';
   td.textContent = 'none';
   tr.append(td);
   return tr;
+}
+function fileText(f) {
+  const pct = f.size ? (100 * f.cached / f.size).toFixed(1) : '0.0';
+  return f.name + ' - ' + pct + '% cached (' + bytes(f.cached) + ' / ' + bytes(f.size) + ')';
 }
 async function tick() {
   let s;
@@ -107,11 +114,14 @@ async function tick() {
   $('port').title = q.error || ('checked ' + (q.checked || 'not yet'));
   $('listen').textContent = s.listeners.length ? 'listening on ' + s.listeners.join(', ') : '';
   $('files').replaceChildren(...(s.openFiles.length
-    ? s.openFiles.map(f => item(f.name + (f.readers > 1 ? ' (' + f.readers + ' readers)' : '')))
+    ? s.openFiles.map(f => item(fileText(f) + (f.readers > 1 ? ' (' + f.readers + ' readers)' : '')))
     : [item('none', 'muted')]));
+  $('cached').replaceChildren(...(s.cachedFiles.length
+    ? s.cachedFiles.map(f => row([f.name, bytes(f.cached), bytes(f.size)]))
+    : [emptyRow(3)]));
   $('peers').replaceChildren(...(s.peers.length
     ? s.peers.map(p => row([p.addr, p.source, rate(p.down), rate(p.up), String(p.pieces)]))
-    : [emptyRow()]));
+    : [emptyRow(5)]));
   $('trackers').replaceChildren(...(s.trackers.length
     ? s.trackers.map(u => item(u))
     : [item('none', 'muted')]));

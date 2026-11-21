@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -39,6 +40,9 @@ func TestStatusPageAndJSON(t *testing.T) {
 	if got.Torrent.Cached != 0 || got.Torrent.Percent != 0 {
 		t.Errorf("cold torrent shows %d cached / %.1f%%", got.Torrent.Cached, got.Torrent.Percent)
 	}
+	if len(got.Open) != 0 || len(got.CachedFiles) != 0 {
+		t.Errorf("cold torrent files = %+v / %+v", got.Open, got.CachedFiles)
+	}
 	if len(got.Listen) == 0 {
 		t.Error("no listening addresses reported")
 	}
@@ -66,6 +70,80 @@ func TestStatusPageAndJSON(t *testing.T) {
 	if res.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("POST status = %d, want 405", res.StatusCode)
 	}
+}
+
+// Open files report their own cached bytes, and closing the reader moves the
+// file into the cached-files list.
+func TestStatusReportsPerFileCache(t *testing.T) {
+	mi, torrentPath, dataRoot, _ := makeTorrent(t)
+	s := newStream(torrentPath, t.TempDir(), 0, 0, 0)
+	t.Cleanup(s.Close)
+
+	seeder := newTestClient(t, dataRoot, true)
+	st, err := seeder.AddTorrent(mi)
+	must(t, err)
+	<-st.GotInfo()
+	must(t, st.VerifyDataContext(t.Context()))
+
+	srv := httptest.NewServer(newStatusHandler(s, &selfTest{}))
+	defer srv.Close()
+
+	f, err := s.OpenFile(t.Context(), "big.t2wsmoke", 0, 0)
+	must(t, err)
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+	}()
+
+	read := make(chan error, 1)
+	go func() {
+		_, err := io.ReadAll(f)
+		read <- err
+	}()
+	waitForPeer(t, s.t, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: seeder.LocalPort()})
+	must(t, <-read)
+
+	got := fetchStatus(t, srv.URL)
+	if len(got.Open) != 1 {
+		t.Fatalf("open files = %+v", got.Open)
+	}
+	if f := got.Open[0]; f.Name != "big.t2wsmoke" || f.Size != 3<<20 || f.Cached == 0 {
+		t.Fatalf("open file = %+v", f)
+	}
+
+	must(t, f.Close())
+	closed = true
+	waitIdle(t, s)
+
+	got = fetchStatus(t, srv.URL)
+	if len(got.Open) != 0 {
+		t.Errorf("closed file still open: %+v", got.Open)
+	}
+	if len(got.CachedFiles) != 1 {
+		t.Fatalf("cached files = %+v", got.CachedFiles)
+	}
+	if f := got.CachedFiles[0]; f.Name != "big.t2wsmoke" || f.Size != 3<<20 || f.Cached == 0 {
+		t.Errorf("cached file = %+v", f)
+	}
+}
+
+func fetchStatus(t *testing.T, baseURL string) statusSnapshot {
+	t.Helper()
+	res, err := http.Get(baseURL + "/_status.json")
+	must(t, err)
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	must(t, err)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d: %s", res.StatusCode, body)
+	}
+	var got statusSnapshot
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode status %q: %v", body, err)
+	}
+	return got
 }
 
 func TestStatusPathsDoNotClaimShareFiles(t *testing.T) {

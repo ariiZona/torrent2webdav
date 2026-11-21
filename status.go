@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"math"
 	"net"
 	"net/http"
 	"sort"
@@ -59,7 +60,9 @@ type statusPeer struct {
 
 type statusFile struct {
 	Name    string `json:"name"`
-	Readers int    `json:"readers"`
+	Size    int64  `json:"size"`
+	Cached  int64  `json:"cached"`
+	Readers int    `json:"readers,omitempty"`
 }
 
 type statusIP struct {
@@ -71,14 +74,15 @@ type statusIP struct {
 }
 
 type statusSnapshot struct {
-	Torrent  statusTorrent  `json:"torrent"`
-	Swarm    statusSwarm    `json:"swarm"`
-	Transfer statusTransfer `json:"transfer"`
-	Open     []statusFile   `json:"openFiles"`
-	Peers    []statusPeer   `json:"peers"`
-	Trackers []string       `json:"trackers"`
-	Listen   []string       `json:"listeners"`
-	Check    statusIP       `json:"selfTest"`
+	Torrent     statusTorrent  `json:"torrent"`
+	Swarm       statusSwarm    `json:"swarm"`
+	Transfer    statusTransfer `json:"transfer"`
+	Open        []statusFile   `json:"openFiles"`
+	CachedFiles []statusFile   `json:"cachedFiles"`
+	Peers       []statusPeer   `json:"peers"`
+	Trackers    []string       `json:"trackers"`
+	Listen      []string       `json:"listeners"`
+	Check       statusIP       `json:"selfTest"`
 }
 
 func newStatusHandler(s *stream, st *selfTest) http.Handler {
@@ -131,11 +135,12 @@ func (h *statusHandler) snapshot() statusSnapshot {
 			Pending:   stats.PendingPeers,
 			HalfOpen:  stats.HalfOpenPeers,
 		},
-		Transfer: statusTransfer{Down: down, Up: up, Downloaded: read, Uploaded: written},
-		Open:     h.s.fileList(),
-		Peers:    peerList(t),
-		Listen:   listenAddrs(cl.ListenAddrs()),
-		Check:    h.st.report(),
+		Transfer:    statusTransfer{Down: down, Up: up, Downloaded: read, Uploaded: written},
+		Open:        h.s.fileList(),
+		CachedFiles: h.s.cachedFileList(),
+		Peers:       peerList(t),
+		Listen:      listenAddrs(cl.ListenAddrs()),
+		Check:       h.st.report(),
 	}
 	if out.Torrent.Size > 0 {
 		out.Torrent.Percent = 100 * float64(out.Torrent.Cached) / float64(out.Torrent.Size)
@@ -175,13 +180,22 @@ func peerList(t *torrent.Torrent) []statusPeer {
 		out = append(out, statusPeer{
 			Addr:   addr,
 			Source: string(pc.Discovery),
-			Down:   st.DownloadRate,
-			Up:     st.LastWriteUploadRate,
+			Down:   finite(st.DownloadRate),
+			Up:     finite(st.LastWriteUploadRate),
 			Pieces: st.RemotePieceCount,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Addr < out[j].Addr })
 	return out
+}
+
+// finite keeps NaN and infinities out of the JSON: encoding/json rejects them,
+// which would otherwise leave the status response empty.
+func finite(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0
+	}
+	return v
 }
 
 func listenAddrs(addrs []net.Addr) []string {

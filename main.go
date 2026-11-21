@@ -571,8 +571,32 @@ func (s *stream) fileList() []statusFile {
 	defer s.mu.Unlock()
 	out := make([]statusFile, 0, len(s.files))
 	for name, readers := range s.files {
-		out = append(out, statusFile{Name: name, Readers: readers})
+		f := statusFile{Name: name, Readers: readers}
+		if s.share != nil {
+			if e := s.share.lookup(name); e != nil && e.file != nil {
+				f.Size, f.Cached = e.size, e.file.BytesCompleted()
+			}
+		}
+		out = append(out, f)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// cachedFileList reports every file with data on disk, including files no
+// client has open.
+func (s *stream) cachedFileList() []statusFile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []statusFile{}
+	if s.share == nil {
+		return out
+	}
+	s.share.walkFiles(func(name string, e *entry) {
+		if cached := e.file.BytesCompleted(); cached > 0 {
+			out = append(out, statusFile{Name: name, Size: e.size, Cached: cached})
+		}
+	})
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
@@ -668,6 +692,25 @@ func (s *share) lookup(name string) *entry {
 		}
 	}
 	return cur
+}
+
+// walkFiles calls f for every file with its share-relative path.
+func (s *share) walkFiles(f func(name string, e *entry)) {
+	var walk func(prefix string, e *entry)
+	walk = func(prefix string, e *entry) {
+		for name, kid := range e.kids {
+			p := name
+			if prefix != "" {
+				p = prefix + "/" + name
+			}
+			if kid.dir {
+				walk(p, kid)
+			} else {
+				f(p, kid)
+			}
+		}
+	}
+	walk("", s.root)
 }
 
 func (s *share) Mkdir(context.Context, string, fs.FileMode) error { return fs.ErrPermission }

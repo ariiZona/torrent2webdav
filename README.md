@@ -36,10 +36,11 @@ Put the `.torrent` in `./torrents/` and set `TORRENT_FILE` in
 ## Status page
 
 `http://DOCKER_HOST:8080/_status` shows the torrent name and infohash, progress,
-download/upload speed, swarm and peer counts, the files open for streaming, the
-connected peers and the configured trackers. It refreshes once a second from
-`/_status.json`. The paths deliberately start with `_` so a torrent file named
-`status` still resolves through WebDAV.
+download/upload speed, swarm and peer counts, the files open for streaming with
+how much of each is cached, all files with cached data, the connected peers and
+the configured trackers. It refreshes once a second from `/_status.json`. The
+paths deliberately start with `_` so a torrent file named `status` still
+resolves through WebDAV.
 
 At startup the app also logs a self-test:
 
