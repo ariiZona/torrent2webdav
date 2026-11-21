@@ -27,6 +27,7 @@ import (
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
+	"github.com/anacrolix/torrent/version"
 	"golang.org/x/net/webdav"
 )
 
@@ -284,12 +285,23 @@ func newStream(torrentFile, cacheDir string, port int, maxBytes int64, ttl time.
 	return s
 }
 
+// clientName identifies this client to peers and UPnP as the torrent library
+// and its version. The library's default includes this module's path instead.
+func clientName() string {
+	return "anacrolix/torrent " + strings.TrimPrefix(version.DefaultHttpUserAgent, "anacrolix-torrent/")
+}
+
 // open starts a fresh client/torrent/share against cacheDir. It is only called
 // before serving or from cleanLoop while no files are open.
 func (s *stream) open() {
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.ListenPort = s.port
 	cfg.Seed = false
+	// Report the torrent library, not this app: the library's default name is
+	// derived from this module's path.
+	name := clientName()
+	cfg.ExtendedHandshakeClientVersion = name
+	cfg.UpnpID = name
 	// DHT and PEX are enabled by NewDefaultClientConfig. Accept peers even while
 	// nothing is being read, so an idle share keeps its connections for the next
 	// play instead of only accepting peers once data is wanted.

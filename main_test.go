@@ -275,6 +275,12 @@ func TestCacheTTLSkipsEmptyPayload(t *testing.T) {
 	}
 }
 
+func TestClientNameHasLibraryVersion(t *testing.T) {
+	if name := clientName(); !strings.HasPrefix(name, "anacrolix/torrent v") {
+		t.Fatalf("client name = %q, want library name and version", name)
+	}
+}
+
 func TestParseSize(t *testing.T) {
 	ok := []struct {
 		in   string
