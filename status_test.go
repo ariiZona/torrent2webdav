@@ -12,7 +12,7 @@ import (
 
 func TestStatusPageAndJSON(t *testing.T) {
 	_, torrentPath, _, _ := makeTorrent(t)
-	s := newStream(torrentPath, t.TempDir(), 0, 0, 0, 0)
+	s := newStream(torrentPath, t.TempDir(), 0, 0, 0, 0, 0)
 	t.Cleanup(s.Close)
 
 	st := &selfTest{ip: "203.0.113.9", port: 42069, portStatus: "OPEN"}
@@ -76,7 +76,7 @@ func TestStatusPageAndJSON(t *testing.T) {
 // file into the cached-files list.
 func TestStatusReportsPerFileCache(t *testing.T) {
 	mi, torrentPath, dataRoot, _ := makeTorrent(t)
-	s := newStream(torrentPath, t.TempDir(), 0, 0, 0, 0)
+	s := newStream(torrentPath, t.TempDir(), 0, 0, 0, 0, 0)
 	t.Cleanup(s.Close)
 
 	seeder := newTestClient(t, dataRoot, true)

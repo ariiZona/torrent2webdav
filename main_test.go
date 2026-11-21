@@ -100,7 +100,7 @@ func TestShareStreamsFromSwarm(t *testing.T) {
 // Over-limit cache is wiped while idle, and the rebuilt session keeps serving.
 func TestCacheEvictionAndRestart(t *testing.T) {
 	mi, torrentPath, dataRoot, content := makeTorrent(t)
-	s := newStream(torrentPath, t.TempDir(), 0, 1<<20, 0, 0) // 1 MiB cap, 3 MiB file
+	s := newStream(torrentPath, t.TempDir(), 0, 1<<20, 0, 0, 0) // 1 MiB cap, 3 MiB file
 	t.Cleanup(s.Close)
 
 	seeder := newTestClient(t, dataRoot, true)
@@ -201,7 +201,7 @@ func TestCacheTTLAcrossRestart(t *testing.T) {
 	const idle = 45 * time.Minute
 	must(t, writeCacheMarker(filepath.Join(managed, cacheMarker), time.Now().Add(-idle)))
 
-	s := newStream(torrentPath, root, 0, 0, ttl, 0)
+	s := newStream(torrentPath, root, 0, 0, ttl, 0, 0)
 	t.Cleanup(s.Close)
 
 	if _, err := os.Stat(payloadFile); err != nil {
@@ -223,7 +223,7 @@ func TestCacheTTLMissingMarkerKeepsPayload(t *testing.T) {
 	payloadFile := filepath.Join(managed, payloadDirName, "cached")
 	must(t, os.WriteFile(payloadFile, []byte("data"), 0o644))
 
-	s := newStream(torrentPath, root, 0, 0, time.Hour, 0)
+	s := newStream(torrentPath, root, 0, 0, time.Hour, 0, 0)
 	t.Cleanup(s.Close)
 	if _, err := os.Stat(payloadFile); err != nil {
 		t.Fatalf("unmarked payload cleared: %v", err)
@@ -240,7 +240,7 @@ func TestCacheTTLExpiredMarkerClearsPayload(t *testing.T) {
 	must(t, os.WriteFile(payloadFile, []byte("data"), 0o644))
 	must(t, writeCacheMarker(filepath.Join(managed, cacheMarker), time.Now().Add(-2*time.Hour)))
 
-	s := newStream(torrentPath, root, 0, 0, time.Hour, 0)
+	s := newStream(torrentPath, root, 0, 0, time.Hour, 0, 0)
 	t.Cleanup(s.Close)
 	if _, err := os.Stat(payloadFile); !os.IsNotExist(err) {
 		t.Fatalf("expired payload survived: %v", err)
@@ -251,7 +251,7 @@ func TestCacheTTLExpiredMarkerClearsPayload(t *testing.T) {
 // payload is already empty.
 func TestCacheTTLSkipsEmptyPayload(t *testing.T) {
 	_, torrentPath, _, _ := makeTorrent(t)
-	s := newStream(torrentPath, t.TempDir(), 0, 0, time.Hour, 0)
+	s := newStream(torrentPath, t.TempDir(), 0, 0, time.Hour, 0, 0)
 	t.Cleanup(s.Close)
 	if got := s.t.BytesCompleted(); got != 0 {
 		t.Fatalf("%d bytes cached before any read", got)
@@ -278,6 +278,25 @@ func TestCacheTTLSkipsEmptyPayload(t *testing.T) {
 func TestClientNameHasLibraryVersion(t *testing.T) {
 	if name := clientName(); !strings.HasPrefix(name, "anacrolix/torrent v") {
 		t.Fatalf("client name = %q, want library name and version", name)
+	}
+}
+
+func TestReadThresholdStartsFullCache(t *testing.T) {
+	_, torrentPath, _, _ := makeTorrent(t)
+	s := newStream(torrentPath, t.TempDir(), 0, 0, 0, 0, 1<<20)
+	t.Cleanup(s.Close)
+
+	e := s.share.lookup("big.t2wsmoke")
+	if e == nil {
+		t.Fatal("file not found in share")
+	}
+	s.noteRead(e, 1<<20-1)
+	if p := e.file.Priority(); p != torrent.PiecePriorityNone {
+		t.Fatalf("priority = %v before threshold", p)
+	}
+	s.noteRead(e, 1)
+	if p := e.file.Priority(); p != torrent.PiecePriorityNormal {
+		t.Fatalf("priority = %v after threshold", p)
 	}
 }
 

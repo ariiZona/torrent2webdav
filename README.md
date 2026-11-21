@@ -69,6 +69,7 @@ Flags and environment variables are equivalent.
 | `-cache-max-size` | `CACHE_MAX_SIZE` | `0` | Clear the cache above this size while idle (`50G`, `1.5TB`, bytes; `0` = no limit) |
 | `-cache-ttl` | `CACHE_TTL` | `0` | Clear the cache after this much idle time (`30m`, `24h`, `168h`; `0` = never) |
 | `-upload-rate` | `UPLOAD_RATE` | `0` | Max upload speed to peers (`1M`, `500K`; bytes/s; `0` = unlimited) |
+| `-full-cache-after` | `FULL_CACHE_AFTER` | `250M` | Fully cache a file after this many bytes have been read through WebDAV (`250M`, `1G`; `0` = never) |
 | `-user` | `WEBDAV_USER` | *(empty)* | Enable HTTP basic auth with this user |
 | `-pass` | `WEBDAV_PASS` | *(empty)* | Password for basic auth |
 
@@ -199,6 +200,10 @@ after an eviction; the working set normally lives in rclone's own cache.
   readahead, which suits rclone's sequential access.
 - When the HTTP client disconnects, the pending torrent read is cancelled, so
   abandoned range requests don't keep pulling data.
+- With `FULL_CACHE_AFTER` set (default 250M), once that many bytes of a file
+  have been read, the rest of the file is requested in full at normal priority.
+  Reads and readahead keep a higher priority, so background filling doesn't
+  compete with what the player seeks to.
 - Inbound peers matter most. On Linux use `network_mode: host`, or forward the
   `TORRENT_PORT` TCP *and* UDP ports on your router. Without inbound
   connectivity you still download, just from fewer peers.

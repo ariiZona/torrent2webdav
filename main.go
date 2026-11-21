@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -54,6 +55,7 @@ func main() {
 	cacheMax := flag.String("cache-max-size", resourceEnv("CACHE_MAX_SIZE", "0"), "clear the cache above this size while idle (e.g. 50G; 0 = no limit)")
 	ttlText := flag.String("cache-ttl", resourceEnv("CACHE_TTL", "0"), "clear the cache after this much idle time (e.g. 24h; 0 = never)")
 	uploadRateText := flag.String("upload-rate", resourceEnv("UPLOAD_RATE", "0"), "max upload speed to peers (e.g. 1M; 0 = unlimited)")
+	fullCacheText := flag.String("full-cache-after", resourceEnv("FULL_CACHE_AFTER", "250M"), "fully cache a file after this many bytes have been read (e.g. 250M; 0 = never)")
 	user := flag.String("user", env("WEBDAV_USER", ""), "optional WebDAV basic-auth username")
 	pass := flag.String("pass", env("WEBDAV_PASS", ""), "optional WebDAV basic-auth password")
 	flag.Parse()
@@ -86,8 +88,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("upload-rate: %v", err)
 	}
+	fullCacheAfter, err := parseSize(*fullCacheText)
+	if err != nil {
+		log.Fatalf("full-cache-after: %v", err)
+	}
 
-	s := newStream(*torrentFile, *cacheDir, torrentPort, maxBytes, cacheTTL, uploadRate)
+	s := newStream(*torrentFile, *cacheDir, torrentPort, maxBytes, cacheTTL, uploadRate, fullCacheAfter)
 	defer s.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -226,12 +232,13 @@ func withBasicAuth(user, pass string, h http.Handler) http.Handler {
 // stream owns the torrent client, its cache, and the current WebDAV share, and
 // can reset all of them to enforce cache limits.
 type stream struct {
-	meta     *metainfo.MetaInfo // original metainfo, for a stable creation date across reopens
-	cacheDir string             // private managed directory under -cache-dir; safe to clear
-	port     int
-	maxBytes int64
-	ttl      time.Duration
-	upload   int64 // bytes per second; 0 = unlimited
+	meta      *metainfo.MetaInfo // original metainfo, for a stable creation date across reopens
+	cacheDir  string             // private managed directory under -cache-dir; safe to clear
+	port      int
+	maxBytes  int64
+	ttl       time.Duration
+	upload    int64 // bytes per second; 0 = unlimited
+	fullAfter int64 // fully cache a file after this many bytes were read; 0 = never
 
 	mu       sync.Mutex
 	cond     *sync.Cond
@@ -251,7 +258,7 @@ type stream struct {
 	closeOnce sync.Once
 }
 
-func newStream(torrentFile, cacheDir string, port int, maxBytes int64, ttl time.Duration, upload int64) *stream {
+func newStream(torrentFile, cacheDir string, port int, maxBytes int64, ttl time.Duration, upload, fullAfter int64) *stream {
 	mi, err := metainfo.LoadFromFile(torrentFile)
 	if err != nil {
 		log.Fatalf("load torrent: %v", err)
@@ -261,16 +268,17 @@ func newStream(torrentFile, cacheDir string, port int, maxBytes int64, ttl time.
 		log.Fatal(err)
 	}
 	s := &stream{
-		meta:     mi,
-		cacheDir: managedDir,
-		port:     port,
-		maxBytes: maxBytes,
-		ttl:      ttl,
-		upload:   upload,
-		files:    map[string]int{},
-		lastUsed: time.Now(),
-		done:     make(chan struct{}),
-		loopDone: make(chan struct{}),
+		meta:      mi,
+		cacheDir:  managedDir,
+		port:      port,
+		maxBytes:  maxBytes,
+		ttl:       ttl,
+		upload:    upload,
+		fullAfter: fullAfter,
+		files:     map[string]int{},
+		lastUsed:  time.Now(),
+		done:      make(chan struct{}),
+		loopDone:  make(chan struct{}),
 	}
 	s.cond = sync.NewCond(&s.mu)
 
@@ -547,8 +555,9 @@ func (s *stream) OpenFile(ctx context.Context, name string, flag int, perm fs.Fi
 	}
 	// Directories are opened for listing too; only files are "loaded".
 	tracked := ""
-	if e := sh.lookup(name); e != nil && !e.dir {
-		tracked = name
+	var e *entry
+	if found := sh.lookup(name); found != nil && !found.dir {
+		e, tracked = found, name
 		s.mu.Lock()
 		if s.files == nil {
 			s.files = map[string]int{}
@@ -556,7 +565,7 @@ func (s *stream) OpenFile(ctx context.Context, name string, flag int, perm fs.Fi
 		s.files[tracked]++
 		s.mu.Unlock()
 	}
-	return &trackedFile{File: f, s: s, name: tracked}, nil
+	return &trackedFile{File: f, s: s, name: tracked, e: e}, nil
 }
 
 // hold pins the current client and torrent for a status snapshot, so a cache
@@ -628,12 +637,17 @@ type trackedFile struct {
 	webdav.File
 	s    *stream
 	name string
+	e    *entry
 	once sync.Once
 }
 
 func (f *trackedFile) Read(p []byte) (int, error) {
 	f.s.touch()
-	return f.File.Read(p)
+	n, err := f.File.Read(p)
+	if n > 0 {
+		f.s.noteRead(f.e, n)
+	}
+	return n, err
 }
 
 func (f *trackedFile) Seek(offset int64, whence int) (int64, error) {
@@ -645,6 +659,28 @@ func (f *trackedFile) Close() error {
 	err := f.File.Close()
 	f.once.Do(func() { f.s.releaseFile(f.name) })
 	return err
+}
+
+// noteRead requests the whole file once fullAfter bytes have been read through
+// WebDAV. Readers keep current and readahead pieces at Now/Readahead, which
+// outrank this Normal fill, so seeks still win.
+func (s *stream) noteRead(e *entry, n int) {
+	if s.fullAfter <= 0 || e == nil {
+		return
+	}
+	if e.readBytes.Add(int64(n)) < s.fullAfter {
+		return
+	}
+	e.fillOnce.Do(func() {
+		s.mu.Lock()
+		current := s.t != nil && s.t == e.file.Torrent() && !s.wiping
+		s.mu.Unlock()
+		if !current {
+			return
+		}
+		log.Printf("full-cache %q after %d bytes read", e.name, s.fullAfter)
+		e.file.SetPriority(torrent.PiecePriorityNormal)
+	})
 }
 
 // share is a read-only in-memory directory tree backed by torrent file readers.
@@ -689,6 +725,9 @@ type entry struct {
 	dir     bool
 	file    *torrent.File
 	kids    map[string]*entry
+
+	readBytes atomic.Int64 // bytes read through WebDAV for this file
+	fillOnce  sync.Once    // set once the full-cache threshold is reached
 }
 
 func (e *entry) Name() string       { return e.name }
