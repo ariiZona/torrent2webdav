@@ -97,7 +97,7 @@ func TestShareStreamsFromSwarm(t *testing.T) {
 	}
 }
 
-// Over-limit cache is wiped while idle, and the rebuilt session keeps serving.
+// Over-limit cache drops files while idle, and the rebuilt session keeps serving.
 func TestCacheEvictionAndRestart(t *testing.T) {
 	mi, torrentPath, dataRoot, content := makeTorrent(t)
 	s := newStream(torrentPath, t.TempDir(), 0, 1<<20, 0, 0, 0) // 1 MiB cap, 3 MiB file
@@ -185,6 +185,56 @@ func TestCacheIdleExpired(t *testing.T) {
 	must(t, os.Mkdir(marker, 0o755))
 	if cacheIdleExpired(dir, time.Hour) {
 		t.Fatal("directory marker treated as expired")
+	}
+}
+
+// Over-limit cache drops the least-recently-read file, not the whole cache.
+func TestEvictionRemovesOldestFileFirst(t *testing.T) {
+	_, torrentPath, dataRoot, _ := makeTorrent(t)
+	cacheDir, payload := plantCache(t, torrentPath, dataRoot)
+
+	s := newStream(torrentPath, cacheDir, 0, 1<<20, 0, 0, 0)
+	t.Cleanup(s.Close)
+	if got := s.t.BytesCompleted(); got <= s.maxBytes {
+		t.Fatalf("only %d bytes cached before eviction", got)
+	}
+	s.mu.Lock()
+	s.fileUsed["big.t2wsmoke"] = time.Now().Add(-2 * time.Hour)
+	s.fileUsed["sub/small.txt"] = time.Now()
+	s.lastUsed = time.Now().Add(-2 * evictIdle)
+	s.mu.Unlock()
+	s.evictIfNeeded()
+
+	if _, err := os.Stat(filepath.Join(payload, "smoke", "big.t2wsmoke")); !os.IsNotExist(err) {
+		t.Fatalf("older file still cached: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(payload, "smoke", "sub", "small.txt")); err != nil {
+		t.Fatalf("newer file was removed: %v", err)
+	}
+}
+
+// CACHE_TTL drops only files whose own last read is older than the TTL.
+func TestCacheTTLRemovesOldestFileFirst(t *testing.T) {
+	_, torrentPath, dataRoot, _ := makeTorrent(t)
+	cacheDir, payload := plantCache(t, torrentPath, dataRoot)
+
+	s := newStream(torrentPath, cacheDir, 0, 0, time.Hour, 0, 0)
+	t.Cleanup(s.Close)
+	if got := s.t.BytesCompleted(); got == 0 {
+		t.Fatal("nothing cached before eviction")
+	}
+	s.mu.Lock()
+	s.fileUsed["big.t2wsmoke"] = time.Now().Add(-2 * time.Hour)
+	s.fileUsed["sub/small.txt"] = time.Now()
+	s.lastUsed = time.Now().Add(-2 * evictIdle)
+	s.mu.Unlock()
+	s.evictIfNeeded()
+
+	if _, err := os.Stat(filepath.Join(payload, "smoke", "big.t2wsmoke")); !os.IsNotExist(err) {
+		t.Fatalf("expired file still cached: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(payload, "smoke", "sub", "small.txt")); err != nil {
+		t.Fatalf("fresh file was removed: %v", err)
 	}
 }
 
@@ -417,6 +467,24 @@ func TestBasicAuthRejectsAnonymous(t *testing.T) {
 	if res.StatusCode != http.StatusNoContent {
 		t.Fatalf("authenticated status = %d, want 204", res.StatusCode)
 	}
+}
+
+// plantCache creates the managed cache and writes the seeded files where the
+// file storage looks for them, so completion is inferred without a swarm.
+func plantCache(t *testing.T, torrentPath, dataRoot string) (cacheDir, payload string) {
+	t.Helper()
+	cacheDir = t.TempDir()
+	init := newStream(torrentPath, cacheDir, 0, 0, 0, 0, 0)
+	payload = init.payloadDir()
+	init.Close()
+	for _, rel := range []string{"big.t2wsmoke", filepath.Join("sub", "small.txt")} {
+		data, err := os.ReadFile(filepath.Join(dataRoot, "smoke", rel))
+		must(t, err)
+		dst := filepath.Join(payload, "smoke", rel)
+		must(t, os.MkdirAll(filepath.Dir(dst), 0o755))
+		must(t, os.WriteFile(dst, data, 0o644))
+	}
+	return cacheDir, payload
 }
 
 func makeTorrent(t *testing.T) (mi *metainfo.MetaInfo, torrentPath, dataRoot string, content []byte) {

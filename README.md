@@ -67,7 +67,7 @@ Flags and environment variables are equivalent.
 | `-torrent-port` | `TORRENT_PORT` | `42069` | BitTorrent TCP + UDP listen port |
 | `-cache-dir` | `CACHE_DIR` | `./cache` | Parent directory for the app's private cache |
 | `-cache-max-size` | `CACHE_MAX_SIZE` | `0` | Clear the cache above this size while idle (`50G`, `1.5TB`, bytes; `0` = no limit) |
-| `-cache-ttl` | `CACHE_TTL` | `0` | Clear the cache after this much idle time (`30m`, `24h`, `168h`; `0` = never) |
+| `-cache-ttl` | `CACHE_TTL` | `0` | Remove files not read for this long (`30m`, `24h`, `168h`; `0` = never) |
 | `-upload-rate` | `UPLOAD_RATE` | `0` | Max upload speed to peers (`1M`, `500K`; bytes/s; `0` = unlimited) |
 | `-full-cache-after` | `FULL_CACHE_AFTER` | `250M` | Fully cache a file after this many bytes have been read through WebDAV (`250M`, `1G`; `0` = never) |
 | `-user` | `WEBDAV_USER` | *(empty)* | Enable HTTP basic auth with this user |
@@ -143,14 +143,16 @@ never change, so clients don't re-download on every container restart.
 ## Cache limits
 
 `CACHE_MAX_SIZE` and `CACHE_TTL` are enforced about once a minute, and only
-while the share is idle: no file open, and no read in the last minute. Both
-policies evict managed torrent data and restart the torrent session; the share
-stays available and the next read downloads from the swarm again.
+while the share is idle: no file open, and no read in the last minute. The
+share stays available and the next read downloads from the swarm again.
 
-That coarse granularity is deliberate: torrent data is stored in whole files
-with piece hashes spread across them, and ripping out individual pieces while a
-reader may still touch them is not safe. So:
-
+- Both limits remove whole files, least-recently-read first.
+- `CACHE_MAX_SIZE` removes files until the cached total fits.
+- `CACHE_TTL` removes files whose last read is older than that.
+- Read times are kept in memory; data cached by an earlier process counts as
+  old as the persisted last-read time.
+- Eviction rebuilds the torrent session. A cached piece that spans a removed
+  file is fetched again on the next read.
 - The cache can grow past `CACHE_MAX_SIZE` during a long stream; eviction waits
   until you stop. Set the limit at least as large as the biggest file you plan
   to watch, or leave it unlimited and rely on rclone's cache.

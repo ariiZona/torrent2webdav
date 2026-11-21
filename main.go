@@ -242,8 +242,9 @@ type stream struct {
 
 	mu       sync.Mutex
 	cond     *sync.Cond
-	active   int            // open WebDAV files and status snapshots; eviction waits for zero
-	files    map[string]int // open WebDAV file names, for the status page
+	active   int                  // open WebDAV files and status snapshots; eviction waits for zero
+	files    map[string]int       // open WebDAV file names, for the status page
+	fileUsed map[string]time.Time // last WebDAV read per file, for oldest-first eviction
 	wiping   bool
 	lastUsed time.Time
 
@@ -276,6 +277,7 @@ func newStream(torrentFile, cacheDir string, port int, maxBytes int64, ttl time.
 		upload:    upload,
 		fullAfter: fullAfter,
 		files:     map[string]int{},
+		fileUsed:  map[string]time.Time{},
 		lastUsed:  time.Now(),
 		done:      make(chan struct{}),
 		loopDone:  make(chan struct{}),
@@ -444,38 +446,147 @@ func (s *stream) evictIfNeeded() {
 		s.mu.Unlock()
 		return
 	}
-	var reason string
 	size := s.t.BytesCompleted()
-	switch {
-	case s.maxBytes > 0 && size > s.maxBytes:
-		reason = fmt.Sprintf("%d bytes cached, limit %d", size, s.maxBytes)
-	case s.ttl > 0 && time.Since(s.lastUsed) > s.ttl:
-		if size == 0 {
-			// Nothing cached: rebuilding the session would only reset the
-			// TTL clock without a read.
-			s.mu.Unlock()
-			return
-		}
-		reason = "idle for " + s.ttl.String()
-	default:
+	overSize := s.maxBytes > 0 && size > s.maxBytes
+	expired := s.ttl > 0 && s.hasExpiredFiles(time.Now().Add(-s.ttl))
+	if !overSize && !expired {
 		s.mu.Unlock()
 		return
 	}
 	s.wiping = true
 	s.mu.Unlock()
 
-	log.Printf("clearing cache: %s", reason)
-	s.close()
-	if err := wipeManagedPayload(s.cacheDir); err != nil {
-		log.Printf("clear cache: %v", err)
-	}
-	s.open()
+	s.evictOldest()
 
 	s.mu.Lock()
-	s.lastUsed = time.Now()
 	s.wiping = false
 	s.cond.Broadcast()
 	s.mu.Unlock()
+}
+
+// hasExpiredFiles reports whether any cached file is older than cutoff. The
+// caller holds s.mu.
+func (s *stream) hasExpiredFiles(cutoff time.Time) bool {
+	if s.share == nil {
+		return false
+	}
+	expired := false
+	s.share.walkFiles(func(name string, e *entry) {
+		if !expired && e.file.BytesCompleted() > 0 && s.fileLastUsed(name).Before(cutoff) {
+			expired = true
+		}
+	})
+	return expired
+}
+
+// fileLastUsed returns the file's last read time, or the last read of any file
+// when it has none (for data cached by an earlier process). Caller holds s.mu.
+func (s *stream) fileLastUsed(name string) time.Time {
+	if used := s.fileUsed[name]; !used.IsZero() {
+		return used
+	}
+	return s.lastUsed
+}
+
+// evictOldest removes whole files in least-recently-read order until the cached
+// total fits maxBytes and no file is older than CACHE_TTL. The session is
+// rebuilt after each batch so the storage's completion map matches the files
+// that remain: the default file storage uses part files and re-derives
+// completion from them on open.
+func (s *stream) evictOldest() {
+	skip := map[string]bool{}
+	for {
+		size := s.t.BytesCompleted()
+		var need int64
+		if s.maxBytes > 0 && size > s.maxBytes {
+			need = size - s.maxBytes
+		}
+		victims := s.oldestFiles(need, skip)
+		if len(victims) == 0 {
+			if need > 0 {
+				// Completion claims cached data but no file owns it; start clean.
+				s.close()
+				if err := wipeManagedPayload(s.cacheDir); err != nil {
+					log.Printf("clear cache: %v", err)
+				}
+				s.open()
+			}
+			return
+		}
+		names := make([]string, len(victims))
+		for i, v := range victims {
+			names[i] = v.name
+			skip[v.name] = true
+		}
+		log.Printf("clearing cache: removing %s (oldest read first)", strings.Join(names, ", "))
+		s.close()
+		for _, v := range victims {
+			for _, path := range []string{v.path, v.path + ".part"} {
+				if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+					log.Printf("clear cache: %v", err)
+				}
+			}
+		}
+		s.open()
+	}
+}
+
+type cacheFile struct {
+	name string
+	path string
+	size int64
+	used time.Time
+}
+
+// oldestFiles returns the least-recently-read cached files that are older than
+// CACHE_TTL, plus enough younger ones to cover need bytes. Sizes come from piece
+// completion, so one batch may free a little less than requested; evictOldest
+// re-checks after reopening and skips names already tried.
+func (s *stream) oldestFiles(need int64, skip map[string]bool) []cacheFile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.share == nil {
+		return nil
+	}
+	cutoff := time.Time{}
+	if s.ttl > 0 {
+		cutoff = time.Now().Add(-s.ttl)
+	}
+	var files []cacheFile
+	base := s.payloadDir()
+	s.share.walkFiles(func(name string, e *entry) {
+		if skip[name] || e.file.BytesCompleted() <= 0 {
+			return
+		}
+		path := filepath.Join(base, e.file.Path())
+		if rel, err := filepath.Rel(base, path); err != nil ||
+			rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return // never delete outside this torrent's payload directory
+		}
+		files = append(files, cacheFile{
+			name: name,
+			path: path,
+			size: e.file.BytesCompleted(),
+			used: s.fileLastUsed(name),
+		})
+	})
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].used.Equal(files[j].used) {
+			return files[i].name < files[j].name
+		}
+		return files[i].used.Before(files[j].used)
+	})
+	var out []cacheFile
+	var freed int64
+	for _, f := range files {
+		expired := !cutoff.IsZero() && f.used.Before(cutoff)
+		if !expired && (need <= 0 || freed >= need) {
+			break
+		}
+		out = append(out, f)
+		freed += f.size
+	}
+	return out
 }
 
 // persistLastUsed records the last read time so CACHE_TTL survives restarts.
@@ -508,9 +619,12 @@ func cacheMarkerTime(cacheDir string) (time.Time, bool) {
 	return fi.ModTime(), true
 }
 
-func (s *stream) touch() {
+func (s *stream) touch(name string) {
 	s.mu.Lock()
 	s.lastUsed = time.Now()
+	if name != "" {
+		s.fileUsed[name] = s.lastUsed
+	}
 	s.mu.Unlock()
 }
 
@@ -642,7 +756,7 @@ type trackedFile struct {
 }
 
 func (f *trackedFile) Read(p []byte) (int, error) {
-	f.s.touch()
+	f.s.touch(f.name)
 	n, err := f.File.Read(p)
 	if n > 0 {
 		f.s.noteRead(f.e, n)
@@ -651,7 +765,7 @@ func (f *trackedFile) Read(p []byte) (int, error) {
 }
 
 func (f *trackedFile) Seek(offset int64, whence int) (int64, error) {
-	f.s.touch()
+	f.s.touch(f.name)
 	return f.File.Seek(offset, whence)
 }
 
