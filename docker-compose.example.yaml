@@ -3,6 +3,9 @@ services:
     # Built by .github/workflows/image.yml. If the GHCR package is private,
     # run `docker login ghcr.io` before pulling.
     image: ghcr.io/ariizona/torrent2webdav:latest
+    # The image runs as 1000:1000; ./cache must be writable by that uid
+    # (see "Cache ownership" in the README).
+    user: "1000:1000"
     # build: .
     # On Linux, network_mode: host gives the best peer connectivity and lets
     # you drop the ports block below.
