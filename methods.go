@@ -9,6 +9,10 @@ const allowHeader = "GET, HEAD, OPTIONS, PROPFIND"
 // so clients see the same methods the wrapper actually allows.
 func methodWrapper(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Torrent contents are untrusted; sandbox and nosniff keep them from
+		// running as same-origin HTML against saved Basic-auth credentials.
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Security-Policy", "sandbox")
 		switch r.Method {
 		case http.MethodGet, http.MethodHead, "PROPFIND":
 			h.ServeHTTP(w, r)

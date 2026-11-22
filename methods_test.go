@@ -71,6 +71,22 @@ func TestMethodWrapperRejectsOtherMethods(t *testing.T) {
 	}
 }
 
+func TestMethodWrapperSetsSecurityHeaders(t *testing.T) {
+	for _, method := range []string{"GET", "HEAD", "PROPFIND", "OPTIONS", "PUT"} {
+		t.Run(method, func(t *testing.T) {
+			h := methodWrapper(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(method, "/file", nil))
+			if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Errorf("%s X-Content-Type-Options = %q, want %q", method, got, "nosniff")
+			}
+			if got := rec.Header().Get("Content-Security-Policy"); got != "sandbox" {
+				t.Errorf("%s Content-Security-Policy = %q, want %q", method, got, "sandbox")
+			}
+		})
+	}
+}
+
 func TestMethodWrapperLeavesAuthInFront(t *testing.T) {
 	h := withBasicAuth("user", "pass", methodWrapper(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})))
 

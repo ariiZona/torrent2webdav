@@ -43,6 +43,9 @@ func TestStatusPageAndJSON(t *testing.T) {
 	if len(got.Open) != 0 || len(got.CachedFiles) != 0 {
 		t.Errorf("cold torrent files = %+v / %+v", got.Open, got.CachedFiles)
 	}
+	if got.Trackers == nil || len(got.Trackers) != 0 {
+		t.Errorf("trackerless torrent trackers = %#v, want empty list", got.Trackers)
+	}
 	if len(got.Listen) == 0 {
 		t.Error("no listening addresses reported")
 	}
@@ -126,6 +129,9 @@ func TestStatusReportsPerFileCache(t *testing.T) {
 	}
 	if f := got.CachedFiles[0]; f.Name != "big.t2wsmoke" || f.Size != 3<<20 || f.Cached == 0 {
 		t.Errorf("cached file = %+v", f)
+	}
+	if got.CachedFilesTotal != len(got.CachedFiles) {
+		t.Errorf("cached files total = %d, want %d", got.CachedFilesTotal, len(got.CachedFiles))
 	}
 }
 

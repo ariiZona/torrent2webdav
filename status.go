@@ -79,10 +79,12 @@ type statusSnapshot struct {
 	Transfer    statusTransfer `json:"transfer"`
 	Open        []statusFile   `json:"openFiles"`
 	CachedFiles []statusFile   `json:"cachedFiles"`
-	Peers       []statusPeer   `json:"peers"`
-	Trackers    []string       `json:"trackers"`
-	Listen      []string       `json:"listeners"`
-	Check       statusIP       `json:"selfTest"`
+	// CachedFilesTotal is the number of cached files before the list cap.
+	CachedFilesTotal int          `json:"cachedFilesTotal"`
+	Peers            []statusPeer `json:"peers"`
+	Trackers         []string     `json:"trackers"`
+	Listen           []string     `json:"listeners"`
+	Check            statusIP     `json:"selfTest"`
 }
 
 func newStatusHandler(s *stream, st *selfTest) http.Handler {
@@ -118,9 +120,10 @@ func (h *statusHandler) snapshot() statusSnapshot {
 	stats := t.Stats()
 	read, written := stats.BytesReadData.Int64(), stats.BytesWrittenData.Int64()
 	down, up := h.rates(read, written)
+	cached, cachedTotal := h.s.cachedFileList()
 
 	out := statusSnapshot{
-		Torrent: statusTorrent{
+		Torrent:          statusTorrent{
 			Name:        t.Name(),
 			InfoHash:    t.InfoHash().HexString(),
 			Size:        t.Length(),
@@ -128,25 +131,28 @@ func (h *statusHandler) snapshot() statusSnapshot {
 			PieceLength: t.Info().PieceLength,
 			Pieces:      int(t.NumPieces()),
 		},
-		Swarm: statusSwarm{
+		Swarm:            statusSwarm{
 			Total:     stats.TotalPeers,
 			Connected: len(t.PeerConns()),
 			Seeders:   stats.ConnectedSeeders,
 			Pending:   stats.PendingPeers,
 			HalfOpen:  stats.HalfOpenPeers,
 		},
-		Transfer:    statusTransfer{Down: down, Up: up, Downloaded: read, Uploaded: written},
-		Open:        h.s.fileList(),
-		CachedFiles: h.s.cachedFileList(),
-		Peers:       peerList(t),
-		Listen:      listenAddrs(cl.ListenAddrs()),
-		Check:       h.st.report(),
+		Transfer:         statusTransfer{Down: down, Up: up, Downloaded: read, Uploaded: written},
+		Open:             h.s.fileList(),
+		CachedFiles:      cached,
+		CachedFilesTotal: cachedTotal,
+		Peers:            peerList(t),
+		Listen:           listenAddrs(cl.ListenAddrs()),
+		Check:            h.st.report(),
 	}
 	if out.Torrent.Size > 0 {
 		out.Torrent.Percent = 100 * float64(out.Torrent.Cached) / float64(out.Torrent.Size)
 	}
 	mi := t.Metainfo()
-	out.Trackers = mi.UpvertedAnnounceList().DistinctValues()
+	// append into an empty slice keeps a trackerless torrent as [] rather than
+	// null, which the page indexes.
+	out.Trackers = append([]string{}, mi.UpvertedAnnounceList().DistinctValues()...)
 	sort.Strings(out.Trackers)
 	return out
 }

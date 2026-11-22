@@ -30,6 +30,9 @@ or without Docker:
 go run . -torrent /path/to/file.torrent -cache-dir ./cache
 ```
 
+WebDAV is served on `127.0.0.1:8080` (localhost only) by default; see
+[LAN and TLS](#lan-and-tls) to expose it on other interfaces.
+
 Put the `.torrent` in `./torrents/` and set `TORRENT_FILE` in
 `docker-compose.yml`.
 
@@ -63,20 +66,22 @@ Flags and environment variables are equivalent.
 | Flag | Env | Default | Meaning |
 |------|-----|---------|---------|
 | `-torrent` | `TORRENT_FILE` | *(required)* | Path to the `.torrent` file |
-| `-webdav-addr` | `WEBDAV_ADDR` | `:8080` | WebDAV listen address |
+| `-webdav-addr` | `WEBDAV_ADDR` | `127.0.0.1:8080` | WebDAV listen address |
 | `-torrent-port` | `TORRENT_PORT` | `42069` | BitTorrent TCP + UDP listen port |
 | `-cache-dir` | `CACHE_DIR` | `./cache` | Parent directory for the app's private cache |
 | `-cache-max-size` | `CACHE_MAX_SIZE` | `0` | Clear the cache above this size while idle (`50G`, `1.5TB`, bytes; `0` = no limit) |
 | `-cache-ttl` | `CACHE_TTL` | `0` | Remove files not read for this long (`30m`, `24h`, `168h`; `0` = never) |
 | `-upload-rate` | `UPLOAD_RATE` | `0` | Max upload speed to peers (`1M`, `500K`; bytes/s; `0` = unlimited) |
-| `-full-cache-after` | `FULL_CACHE_AFTER` | `250M` | Fully cache a file after this many bytes have been read through WebDAV (`250M`, `1G`; `0` = never) |
+| `-full-cache-after` | `FULL_CACHE_AFTER` | `250M` | After this many bytes of a file have been read through WebDAV, download the rest of it in the background, continuing after the client disconnects (`250M`, `1G`; `0` = never) |
 | `-user` | `WEBDAV_USER` | *(empty)* | Enable HTTP basic auth with this user |
 | `-pass` | `WEBDAV_PASS` | *(empty)* | Password for basic auth |
 
 With Compose, set `TORRENT_PORT` in `.env` (copy `.env.example`): both the
 published TCP/UDP ports and the app's listen port follow it. Under
 `network_mode: host`, only the listen port matters. To change the WebDAV port,
-change `WEBDAV_ADDR` and the container port mapping together. `WEBDAV_USER` and `WEBDAV_PASS` must be set together (or both
+change `WEBDAV_ADDR` and the container port mapping together; inside a container
+it must stay `:PORT` or `0.0.0.0:PORT` (not `127.0.0.1`), or the published port
+cannot reach it. `WEBDAV_USER` and `WEBDAV_PASS` must be set together (or both
 left empty): a lone username or password stops the app at startup instead of
 serving an unprotected share.
 
@@ -118,8 +123,10 @@ can reach it by default. To mount it from another machine:
   a specific host IP) and enable basic auth. The password crosses the network in
   the clear, so only do this on a network you trust.
 
-Running without Docker, the binary listens on `:8080` (all interfaces) by
-default; pass `-webdav-addr 127.0.0.1:8080` to restrict it the same way.
+Running without Docker, the binary listens on `127.0.0.1:8080` (localhost
+only) by default. To expose it on the LAN, pass
+`-webdav-addr 0.0.0.0:8080` or set `WEBDAV_ADDR=0.0.0.0:8080` (`:8080` is
+equivalent), and enable basic auth or put a TLS proxy in front.
 
 ## What the share looks like
 
@@ -165,6 +172,11 @@ share stays available and the next read downloads from the swarm again.
   directory across different torrents, old torrents' data still occupies disk
   until the TTL clears the directory; a dedicated cache dir per torrent is
   simplest.
+- **Run at most one instance per `CACHE_DIR`.** Two processes or containers
+  pointed at the same directory (a shared bind mount or host path) both adopt it
+  and write the same payload, and either instance's TTL/eviction can delete data
+  the other is still writing, losing it on restart. Reusing the directory across
+  restarts is fine; sharing it between running instances is not.
 - rclone's `--vfs-cache-max-size` is a separate cache on the client. Size both.
 
 Example: keep at most 50 GiB and drop it after a day without playback.
@@ -174,6 +186,25 @@ environment:
   CACHE_MAX_SIZE: 50G
   CACHE_TTL: 24h
 ```
+
+## Run unprivileged (optional)
+
+The image runs as root so it can create and write the bind-mounted `./cache`.
+To run it as another uid, create the cache first, chown it, and set the user:
+
+```sh
+mkdir -p ./cache && sudo chown 1000:1000 ./cache
+```
+
+```yaml
+services:
+  torrent2webdav:
+    user: "1000:1000"
+```
+
+With `docker run`, pass `--user 1000:1000 ...` instead. Cache files are then
+owned by that uid. An existing root-owned cache keeps failing with permission
+errors until you `chown` it.
 
 ## Big torrents
 
@@ -203,9 +234,11 @@ after an eviction; the working set normally lives in rclone's own cache.
 - When the HTTP client disconnects, the pending torrent read is cancelled, so
   abandoned range requests don't keep pulling data.
 - With `FULL_CACHE_AFTER` set (default 250M), once that many bytes of a file
-  have been read, the rest of the file is requested in full at normal priority.
-  Reads and readahead keep a higher priority, so background filling doesn't
-  compete with what the player seeks to.
+  have been read, the rest of the file is downloaded in the background at normal
+  priority, even if playback stops: three minutes into a 60 GB file queues all
+  60 GB. Set `0` to disable, and size `CACHE_MAX_SIZE` (or a dedicated cache
+  dir) for the largest file you watch. Reads and readahead keep a higher
+  priority, so background filling doesn't compete with what the player seeks to.
 - Inbound peers matter most. On Linux use `network_mode: host`, or forward the
   `TORRENT_PORT` TCP *and* UDP ports on your router. Without inbound
   connectivity you still download, just from fewer peers.
@@ -229,8 +262,9 @@ after an eviction; the working set normally lives in rclone's own cache.
   timeout on the WebDAV side by design.
 - Seeding is enabled: the container uploads cached pieces to peers, including
   while nothing is being read. It only downloads pieces requested through
-  WebDAV, so it never fetches the whole torrent just to seed it. Cap the upload
-  bandwidth with `UPLOAD_RATE` if needed.
+  WebDAV (plus the `FULL_CACHE_AFTER` background fill), so it never fetches the
+  whole torrent just to seed it. Cap the upload bandwidth with `UPLOAD_RATE` if
+  needed.
 - Files without an extension can still make PROPFIND read 512 bytes for MIME
   sniffing (and thus wait for the swarm). Everything with an extension lists
   instantly.

@@ -73,3 +73,15 @@ func TestShutdownCancelsBlockedHandler(t *testing.T) {
 		t.Fatal("shutdown did not return after the last handler exited")
 	}
 }
+
+// Requests are bounded, responses are not: a streaming read may legitimately
+// outlast any read timeout.
+func TestHTTPLifecycleTimeouts(t *testing.T) {
+	l := newHTTPLifecycle(http.NotFoundHandler(), time.Second)
+	if l.srv.ReadTimeout <= 0 {
+		t.Fatal("ReadTimeout must be set so a slow request body cannot hold a handler forever")
+	}
+	if l.srv.WriteTimeout != 0 {
+		t.Fatal("WriteTimeout must stay unset so long responses can still stream")
+	}
+}

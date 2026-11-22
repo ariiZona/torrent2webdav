@@ -35,9 +35,9 @@ func newHTTPLifecycle(h http.Handler, grace time.Duration) *httpLifecycle {
 	l.cond = sync.NewCond(&l.mu)
 	l.srv = &http.Server{
 		Handler:           l.track(h),
+		ReadTimeout:       time.Minute, // Bounds the request only; WriteTimeout stays unset so responses can stream.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
-		// No WriteTimeout: a read can legitimately block until the swarm delivers data.
 		BaseContext: func(net.Listener) context.Context { return l.ctx },
 	}
 	return l

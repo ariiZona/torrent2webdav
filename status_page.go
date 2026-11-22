@@ -76,12 +76,12 @@ function row(cells) {
   }
   return tr;
 }
-function emptyRow(cols) {
+function emptyRow(cols, text = 'none') {
   const tr = document.createElement('tr');
   const td = document.createElement('td');
   td.colSpan = cols;
   td.className = 'muted';
-  td.textContent = 'none';
+  td.textContent = text;
   tr.append(td);
   return tr;
 }
@@ -89,15 +89,23 @@ function fileText(f) {
   const pct = f.size ? (100 * f.cached / f.size).toFixed(1) : '0.0';
   return f.name + ' - ' + pct + '% cached (' + bytes(f.cached) + ' / ' + bytes(f.size) + ')';
 }
+let busy = false;
 async function tick() {
+  if (busy) return;
+  busy = true;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 5000);
   let s;
   try {
-    const r = await fetch('/_status.json', {cache: 'no-store'});
+    const r = await fetch('/_status.json', {cache: 'no-store', signal: ctrl.signal});
     if (!r.ok) throw new Error('HTTP ' + r.status);
     s = await r.json();
   } catch (e) {
     $('name').textContent = 'status unavailable: ' + e.message;
     return;
+  } finally {
+    clearTimeout(timer);
+    busy = false;
   }
   const t = s.torrent, q = s.selfTest;
   document.title = t.name + ' - torrent2webdav';
@@ -116,9 +124,11 @@ async function tick() {
   $('files').replaceChildren(...(s.openFiles.length
     ? s.openFiles.map(f => item(fileText(f) + (f.readers > 1 ? ' (' + f.readers + ' readers)' : '')))
     : [item('none', 'muted')]));
-  $('cached').replaceChildren(...(s.cachedFiles.length
-    ? s.cachedFiles.map(f => row([f.name, bytes(f.cached), bytes(f.size)]))
-    : [emptyRow(3)]));
+  const cached = s.cachedFiles.map(f => row([f.name, bytes(f.cached), bytes(f.size)]));
+  if (s.cachedFilesTotal > s.cachedFiles.length) {
+    cached.push(emptyRow(3, 'showing ' + s.cachedFiles.length + ' of ' + s.cachedFilesTotal));
+  }
+  $('cached').replaceChildren(...(cached.length ? cached : [emptyRow(3)]));
   $('peers').replaceChildren(...(s.peers.length
     ? s.peers.map(p => row([p.addr, p.source, rate(p.down), rate(p.up), String(p.pieces)]))
     : [emptyRow(5)]));

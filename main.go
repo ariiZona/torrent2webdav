@@ -49,13 +49,13 @@ const (
 
 func main() {
 	torrentFile := flag.String("torrent", env("TORRENT_FILE", ""), "path to the .torrent file (required)")
-	webdavAddr := flag.String("webdav-addr", env("WEBDAV_ADDR", ":8080"), "WebDAV listen address")
-	portText := flag.String("torrent-port", resourceEnv("TORRENT_PORT", "42069"), "BitTorrent TCP/UDP listen port")
+	webdavAddr := flag.String("webdav-addr", env("WEBDAV_ADDR", "127.0.0.1:8080"), "WebDAV listen address")
+	portText := flag.String("torrent-port", env("TORRENT_PORT", "42069"), "BitTorrent TCP/UDP listen port")
 	cacheDir := flag.String("cache-dir", env("CACHE_DIR", "./cache"), "directory for downloaded pieces")
-	cacheMax := flag.String("cache-max-size", resourceEnv("CACHE_MAX_SIZE", "0"), "clear the cache above this size while idle (e.g. 50G; 0 = no limit)")
-	ttlText := flag.String("cache-ttl", resourceEnv("CACHE_TTL", "0"), "clear the cache after this much idle time (e.g. 24h; 0 = never)")
-	uploadRateText := flag.String("upload-rate", resourceEnv("UPLOAD_RATE", "0"), "max upload speed to peers (e.g. 1M; 0 = unlimited)")
-	fullCacheText := flag.String("full-cache-after", resourceEnv("FULL_CACHE_AFTER", "250M"), "fully cache a file after this many bytes have been read (e.g. 250M; 0 = never)")
+	cacheMax := flag.String("cache-max-size", env("CACHE_MAX_SIZE", "0"), "clear the cache above this size while idle (e.g. 50G; 0 = no limit)")
+	ttlText := flag.String("cache-ttl", env("CACHE_TTL", "0"), "clear the cache after this much idle time (e.g. 24h; 0 = never)")
+	uploadRateText := flag.String("upload-rate", env("UPLOAD_RATE", "0"), "max upload speed to peers (e.g. 1M; 0 = unlimited)")
+	fullCacheText := flag.String("full-cache-after", env("FULL_CACHE_AFTER", "250M"), "download the rest of a file after this many bytes have been read (e.g. 250M; 0 = never)")
 	user := flag.String("user", env("WEBDAV_USER", ""), "optional WebDAV basic-auth username")
 	pass := flag.String("pass", env("WEBDAV_PASS", ""), "optional WebDAV basic-auth password")
 	flag.Parse()
@@ -127,13 +127,6 @@ func main() {
 
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func resourceEnv(key, def string) string {
-	if v, ok := os.LookupEnv(key); ok {
 		return v
 	}
 	return def
@@ -293,6 +286,11 @@ func newStream(torrentFile, cacheDir string, port int, maxBytes int64, ttl time.
 		log.Printf("cache idle for over %s, clearing %s", ttl, filepath.Join(s.cacheDir, payloadDirName))
 		if err := wipeManagedPayload(s.cacheDir); err != nil {
 			log.Printf("clear cache: %v", err)
+		} else {
+			// Start the TTL afresh: the stale marker must not wipe data written
+			// after this start if the process dies before the next clean tick.
+			s.lastUsed = time.Now()
+			s.persistLastUsed()
 		}
 	}
 	s.open()
@@ -309,10 +307,13 @@ func clientName() string {
 	return "anacrolix/torrent " + strings.TrimPrefix(version.DefaultHttpUserAgent, "anacrolix-torrent/")
 }
 
+// newClientConfig is a variable so tests can disable network discovery.
+var newClientConfig = torrent.NewDefaultClientConfig
+
 // open starts a fresh client/torrent/share against cacheDir. It is only called
 // before serving or from cleanLoop while no files are open.
 func (s *stream) open() {
-	cfg := torrent.NewDefaultClientConfig()
+	cfg := newClientConfig()
 	cfg.ListenPort = s.port
 	cfg.Seed = true // upload cached pieces to peers, not only while downloading
 	if s.upload > 0 {
@@ -456,27 +457,33 @@ func (s *stream) evictIfNeeded() {
 	s.wiping = true
 	s.mu.Unlock()
 
-	s.evictOldest()
+	cleaned := s.evictOldest()
 
 	s.mu.Lock()
 	s.wiping = false
+	if cleaned {
+		s.lastUsed = time.Now()
+	}
 	s.cond.Broadcast()
 	s.mu.Unlock()
+	if cleaned {
+		s.persistLastUsed()
+	}
 }
 
-// hasExpiredFiles reports whether any cached file is older than cutoff. The
-// caller holds s.mu.
+// hasExpiredFiles reports whether any cached file is older than cutoff. It walks
+// the torrent, not the share, so cached padding files can expire too. The caller
+// holds s.mu.
 func (s *stream) hasExpiredFiles(cutoff time.Time) bool {
-	if s.share == nil {
+	if s.t == nil {
 		return false
 	}
-	expired := false
-	s.share.walkFiles(func(name string, e *entry) {
-		if !expired && e.file.BytesCompleted() > 0 && s.fileLastUsed(name).Before(cutoff) {
-			expired = true
+	for _, f := range s.t.Files() {
+		if f.BytesCompleted() > 0 && s.fileLastUsed(f.DisplayPath()).Before(cutoff) {
+			return true
 		}
-	})
-	return expired
+	}
+	return false
 }
 
 // fileLastUsed returns the file's last read time, or the last read of any file
@@ -489,11 +496,11 @@ func (s *stream) fileLastUsed(name string) time.Time {
 }
 
 // evictOldest removes whole files in least-recently-read order until the cached
-// total fits maxBytes and no file is older than CACHE_TTL. The session is
-// rebuilt after each batch so the storage's completion map matches the files
-// that remain: the default file storage uses part files and re-derives
-// completion from them on open.
-func (s *stream) evictOldest() {
+// total fits maxBytes and no file is older than CACHE_TTL, reporting whether it
+// cleared any data. The session is rebuilt after each batch so the storage's
+// completion map matches the files that remain: the default file storage uses
+// part files and re-derives completion from them on open.
+func (s *stream) evictOldest() (cleaned bool) {
 	skip := map[string]bool{}
 	for {
 		size := s.t.BytesCompleted()
@@ -504,10 +511,13 @@ func (s *stream) evictOldest() {
 		victims := s.oldestFiles(need, skip)
 		if len(victims) == 0 {
 			if need > 0 {
-				// Completion claims cached data but no file owns it; start clean.
+				// Completion claims cached data but no file owns it; clear only
+				// this torrent, never the sibling hash directories.
 				s.close()
-				if err := wipeManagedPayload(s.cacheDir); err != nil {
+				if err := os.RemoveAll(s.payloadDir()); err != nil {
 					log.Printf("clear cache: %v", err)
+				} else {
+					cleaned = true
 				}
 				s.open()
 			}
@@ -519,12 +529,22 @@ func (s *stream) evictOldest() {
 			skip[v.name] = true
 		}
 		log.Printf("clearing cache: removing %s (oldest read first)", strings.Join(names, ", "))
+		cleaned = true
 		s.close()
 		for _, v := range victims {
+			found := false
 			for _, path := range []string{v.path, v.path + ".part"} {
+				fi, err := os.Lstat(path)
+				if err != nil || !fi.Mode().IsRegular() {
+					continue
+				}
+				found = true
 				if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 					log.Printf("clear cache: %v", err)
 				}
+			}
+			if !found {
+				log.Printf("clear cache: %s is not on disk; skipping", v.path)
 			}
 		}
 		s.open()
@@ -538,14 +558,35 @@ type cacheFile struct {
 	used time.Time
 }
 
+// cacheFilePath returns where the file storage keeps f. The storage omits the
+// torrent name when it is metainfo.NoName (or empty), and a single-file torrent
+// with no usable name is stored under its infohash instead of at the torrent
+// directory itself. File.Path() always includes the name, so it cannot be
+// joined with the payload directory directly.
+func (s *stream) cacheFilePath(f *torrent.File) string {
+	base := s.payloadDir()
+	info := s.t.Info()
+	name := info.BestName()
+	if !info.IsDir() && (name == metainfo.NoName || name == "") {
+		return filepath.Join(base, s.t.InfoHash().HexString())
+	}
+	p := f.Path()
+	if name == metainfo.NoName || name == "" {
+		p = strings.TrimPrefix(strings.TrimPrefix(p, name), "/")
+	}
+	return filepath.Join(base, p)
+}
+
 // oldestFiles returns the least-recently-read cached files that are older than
-// CACHE_TTL, plus enough younger ones to cover need bytes. Sizes come from piece
-// completion, so one batch may free a little less than requested; evictOldest
-// re-checks after reopening and skips names already tried.
+// CACHE_TTL, plus enough younger ones to cover need bytes. It walks the torrent,
+// not the share, so padding files (hidden from WebDAV) stay evictable. Sizes
+// come from piece completion, so one batch may free a little less than
+// requested; evictOldest re-checks after reopening and skips names already
+// tried.
 func (s *stream) oldestFiles(need int64, skip map[string]bool) []cacheFile {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.share == nil {
+	if s.t == nil {
 		return nil
 	}
 	cutoff := time.Time{}
@@ -554,22 +595,24 @@ func (s *stream) oldestFiles(need int64, skip map[string]bool) []cacheFile {
 	}
 	var files []cacheFile
 	base := s.payloadDir()
-	s.share.walkFiles(func(name string, e *entry) {
-		if skip[name] || e.file.BytesCompleted() <= 0 {
-			return
+	for _, f := range s.t.Files() {
+		name := f.DisplayPath()
+		cached := f.BytesCompleted()
+		if skip[name] || cached <= 0 {
+			continue
 		}
-		path := filepath.Join(base, e.file.Path())
+		path := s.cacheFilePath(f)
 		if rel, err := filepath.Rel(base, path); err != nil ||
 			rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return // never delete outside this torrent's payload directory
+			continue // never delete outside this torrent's payload directory
 		}
 		files = append(files, cacheFile{
 			name: name,
 			path: path,
-			size: e.file.BytesCompleted(),
+			size: cached,
 			used: s.fileLastUsed(name),
 		})
-	})
+	}
 	sort.Slice(files, func(i, j int) bool {
 		if files[i].used.Equal(files[j].used) {
 			return files[i].name < files[j].name
@@ -729,22 +772,32 @@ func (s *stream) fileList() []statusFile {
 	return out
 }
 
-// cachedFileList reports every file with data on disk, including files no
-// client has open.
-func (s *stream) cachedFileList() []statusFile {
+// statusFileLimit caps how many cached files a status snapshot lists.
+const statusFileLimit = 500
+
+// cachedFileList reports files with data on disk, including files no client has
+// open, capped at statusFileLimit, and the true number of cached files. The
+// caller must hold() a snapshot, which keeps the share from being swapped while
+// it is walked outside the lock.
+func (s *stream) cachedFileList() ([]statusFile, int) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.share
+	s.mu.Unlock()
 	out := []statusFile{}
-	if s.share == nil {
-		return out
+	if sh == nil {
+		return out, 0
 	}
-	s.share.walkFiles(func(name string, e *entry) {
+	total := 0
+	sh.walkFiles(func(name string, e *entry) {
 		if cached := e.file.BytesCompleted(); cached > 0 {
-			out = append(out, statusFile{Name: name, Size: e.size, Cached: cached})
+			total++
+			if total <= statusFileLimit {
+				out = append(out, statusFile{Name: name, Size: e.size, Cached: cached})
+			}
 		}
 	})
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
+	return out, total
 }
 
 type trackedFile struct {
@@ -802,12 +855,22 @@ type share struct {
 	root *entry
 }
 
+// isPadFile reports whether fi is a BEP 47 padding file. They exist only to
+// align pieces; their bytes must stay in the torrent for size accounting but
+// must not appear as downloadable files.
+func isPadFile(fi metainfo.FileInfo) bool {
+	return strings.Contains(fi.Attr, "p")
+}
+
 func newShare(t *torrent.Torrent, created int64) *share {
 	// Stable modtime (torrent creation date, or the epoch) so clients don't
 	// treat files as changed on every container restart.
 	mod := time.Unix(created, 0)
 	root := &entry{name: t.Name(), dir: true, modTime: mod, kids: map[string]*entry{}}
 	for _, f := range t.Files() {
+		if isPadFile(f.FileInfo()) {
+			continue
+		}
 		// x/net/webdav sniffs unknown extensions for the getcontenttype property
 		// by reading 512 bytes. Registering a type keeps PROPFIND local instead
 		// of blocking on the swarm.

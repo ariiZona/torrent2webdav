@@ -24,6 +24,26 @@ import (
 
 const testSmallText = "hello from the swarm\n"
 
+// TestMain keeps stream clients from touching DHT, PEX, trackers or UPnP in tests.
+func TestMain(m *testing.M) {
+	newClientConfig = func() *torrent.ClientConfig {
+		cfg := torrent.NewDefaultClientConfig()
+		cfg.NoDHT = true
+		cfg.DisablePEX = true
+		cfg.DisableTrackers = true
+		cfg.NoDefaultPortForwarding = true
+		return cfg
+	}
+	os.Exit(m.Run())
+}
+
+func TestTestClientConfigDisablesNetwork(t *testing.T) {
+	cfg := newClientConfig()
+	if !cfg.NoDHT || !cfg.DisablePEX || !cfg.DisableTrackers || !cfg.NoDefaultPortForwarding {
+		t.Fatal("test client config must disable DHT, PEX, trackers and port forwarding")
+	}
+}
+
 // End-to-end: one local client seeds a real torrent, the WebDAV share streams it
 // from that peer, including a ranged read into the middle of the file.
 func TestShareStreamsFromSwarm(t *testing.T) {
@@ -40,9 +60,17 @@ func TestShareStreamsFromSwarm(t *testing.T) {
 	<-st.GotInfo()
 	must(t, st.VerifyDataContext(t.Context()))
 
+	sh := newShare(dlt, mi.CreationDate)
+	// This torrent has no padding files, so the share still lists every file.
+	for _, name := range []string{"big.t2wsmoke", "sub/small.txt"} {
+		if e := sh.lookup(name); e == nil || e.dir {
+			t.Errorf("%s missing from the share", name)
+		}
+	}
+
 	srv := httptest.NewServer(methodWrapper(&webdav.Handler{
 		Prefix:     "/",
-		FileSystem: newShare(dlt, mi.CreationDate),
+		FileSystem: sh,
 		LockSystem: webdav.NewMemLS(),
 	}))
 	defer srv.Close()
@@ -94,6 +122,69 @@ func TestShareStreamsFromSwarm(t *testing.T) {
 	}
 	if got := res.Header.Get("Allow"); got != allowHeader {
 		t.Errorf("PUT Allow = %q, want %q", got, allowHeader)
+	}
+}
+
+func TestIsPadFile(t *testing.T) {
+	for _, tc := range []struct {
+		attr string
+		want bool
+	}{
+		{"p", true},
+		{"px", true}, // any flagged padding file, like the library's own check
+		{"", false},
+		{"x", false},
+		{"h", false},
+	} {
+		fi := metainfo.FileInfo{ExtendedFileAttrs: metainfo.ExtendedFileAttrs{Attr: tc.attr}}
+		if got := isPadFile(fi); got != tc.want {
+			t.Errorf("isPadFile(attr %q) = %v, want %v", tc.attr, got, tc.want)
+		}
+	}
+}
+
+// BEP 47 padding files must be cached (and evictable) but not served.
+func TestShareHidesPadFiles(t *testing.T) {
+	contents := map[string][]byte{"a.txt": []byte("aaaa"), "b.txt": []byte("bbbbbbbb")}
+	info := metainfo.Info{
+		Name:        "pads",
+		PieceLength: 8,
+		Files: []metainfo.FileInfo{
+			{Path: []string{"a.txt"}, Length: int64(len(contents["a.txt"]))},
+			{Path: []string{".pad", "3"}, Length: 3, ExtendedFileAttrs: metainfo.ExtendedFileAttrs{Attr: "p"}},
+			{Path: []string{"b.txt"}, Length: int64(len(contents["b.txt"]))},
+		},
+	}
+	must(t, info.GeneratePieces(func(fi metainfo.FileInfo) (io.ReadCloser, error) {
+		if isPadFile(fi) {
+			return io.NopCloser(bytes.NewReader(make([]byte, fi.Length))), nil
+		}
+		return io.NopCloser(bytes.NewReader(contents[strings.Join(fi.Path, "/")])), nil
+	}))
+	infoBytes, err := bencode.Marshal(info)
+	must(t, err)
+	mi := &metainfo.MetaInfo{InfoBytes: infoBytes, CreationDate: 1700000000}
+
+	dl := newTestClient(t, t.TempDir(), false)
+	tor, err := dl.AddTorrent(mi)
+	must(t, err)
+	<-tor.GotInfo()
+	// The pad stays in the torrent, so its cached bytes can still be evicted.
+	if got := len(tor.Files()); got != 3 {
+		t.Fatalf("torrent has %d files, want 3 including the pad", got)
+	}
+
+	sh := newShare(tor, mi.CreationDate)
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if e := sh.lookup(name); e == nil || e.dir {
+			t.Errorf("%s missing from the share", name)
+		}
+	}
+	if e := sh.lookup(".pad/3"); e != nil {
+		t.Error("padding file listed in the share")
+	}
+	if e := sh.lookup(".pad"); e != nil {
+		t.Error("pad-only directory listed in the share")
 	}
 }
 
@@ -213,6 +304,50 @@ func TestEvictionRemovesOldestFileFirst(t *testing.T) {
 	}
 }
 
+// A size eviction must clear only the current torrent, even when the storage
+// name makes File.Path() disagree with the on-disk path.
+func TestEvictionNoNameKeepsSiblingPayload(t *testing.T) {
+	mi, torrentPath, content := makeNoNameTorrent(t)
+	cacheDir := t.TempDir()
+	init := newStream(torrentPath, cacheDir, 0, 0, 0, 0, 0)
+	payload := init.payloadDir()
+	init.Close()
+
+	// The file storage keeps a single-file NoName torrent under its infohash.
+	self := filepath.Join(payload, mi.HashInfoBytes().HexString())
+	must(t, os.WriteFile(self, content, 0o644))
+	// A file in the same payload dir must survive a per-file eviction; the
+	// no-victim fallback would remove the whole directory.
+	sentinel := filepath.Join(payload, "unrelated-sentinel")
+	must(t, os.WriteFile(sentinel, []byte("keep"), 0o644))
+	sibling := filepath.Join(filepath.Dir(payload), "sibling", "keep")
+	must(t, os.MkdirAll(filepath.Dir(sibling), 0o755))
+	must(t, os.WriteFile(sibling, []byte("keep"), 0o644))
+
+	s := newStream(torrentPath, cacheDir, 0, 1<<10, 0, 0, 0)
+	t.Cleanup(s.Close)
+	if got := s.t.BytesCompleted(); got != int64(len(content)) {
+		t.Fatalf("cached %d of %d bytes before eviction", got, len(content))
+	}
+	s.mu.Lock()
+	s.lastUsed = time.Now().Add(-2 * evictIdle)
+	s.mu.Unlock()
+	s.evictIfNeeded()
+
+	if _, err := os.Stat(sibling); err != nil {
+		t.Fatalf("sibling torrent payload was removed: %v", err)
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("same-torrent sentinel was removed, not a per-file eviction: %v", err)
+	}
+	if _, err := os.Stat(self); !os.IsNotExist(err) {
+		t.Fatalf("torrent data survived eviction: %v", err)
+	}
+	if got := s.t.BytesCompleted(); got > s.maxBytes {
+		t.Fatalf("%d bytes still cached, over maxBytes %d", got, s.maxBytes)
+	}
+}
+
 // CACHE_TTL drops only files whose own last read is older than the TTL.
 func TestCacheTTLRemovesOldestFileFirst(t *testing.T) {
 	_, torrentPath, dataRoot, _ := makeTorrent(t)
@@ -235,6 +370,9 @@ func TestCacheTTLRemovesOldestFileFirst(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(payload, "smoke", "sub", "small.txt")); err != nil {
 		t.Fatalf("fresh file was removed: %v", err)
+	}
+	if used, ok := cacheMarkerTime(s.cacheDir); !ok || time.Since(used) > 5*time.Second {
+		t.Fatal("marker not refreshed after eviction")
 	}
 }
 
@@ -294,6 +432,18 @@ func TestCacheTTLExpiredMarkerClearsPayload(t *testing.T) {
 	t.Cleanup(s.Close)
 	if _, err := os.Stat(payloadFile); !os.IsNotExist(err) {
 		t.Fatalf("expired payload survived: %v", err)
+	}
+	// The wipe must restart the TTL, or a crash before the next clean tick
+	// would leave the stale marker to wipe freshly cached data on restart.
+	used, ok := cacheMarkerTime(managed)
+	if !ok {
+		t.Fatal("marker missing after startup wipe")
+	}
+	if age := time.Since(used); age < -time.Second || age > 5*time.Second {
+		t.Fatalf("marker age after startup wipe = %v, want fresh", age)
+	}
+	if cacheIdleExpired(managed, time.Hour) {
+		t.Fatal("cache expired right after startup wipe")
 	}
 }
 
@@ -506,6 +656,31 @@ func makeTorrent(t *testing.T) (mi *metainfo.MetaInfo, torrentPath, dataRoot str
 	mi = &metainfo.MetaInfo{InfoBytes: infoBytes, CreationDate: 1700000000}
 
 	torrentPath = filepath.Join(t.TempDir(), "smoke.torrent")
+	f, err := os.Create(torrentPath)
+	must(t, err)
+	must(t, mi.Write(f))
+	must(t, f.Close())
+	return
+}
+
+// makeNoNameTorrent builds a single-file torrent whose name is metainfo.NoName,
+// the sentinel the library uses when a torrent is built from ".".
+func makeNoNameTorrent(t *testing.T) (mi *metainfo.MetaInfo, torrentPath string, content []byte) {
+	t.Helper()
+	content = make([]byte, 3<<20)
+	_, err := rand.Read(content)
+	must(t, err)
+	src := filepath.Join(t.TempDir(), "payload.bin")
+	must(t, os.WriteFile(src, content, 0o644))
+
+	info := metainfo.Info{PieceLength: 256 << 10}
+	must(t, info.BuildFromFilePath(src))
+	info.Name = metainfo.NoName
+	infoBytes, err := bencode.Marshal(info)
+	must(t, err)
+	mi = &metainfo.MetaInfo{InfoBytes: infoBytes, CreationDate: 1700000000}
+
+	torrentPath = filepath.Join(t.TempDir(), "noname.torrent")
 	f, err := os.Create(torrentPath)
 	must(t, err)
 	must(t, mi.Write(f))
