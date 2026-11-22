@@ -108,7 +108,9 @@ let cached = {list: [], total: 0};
 let cachedPage = 0, cachedSort = 'name', cachedDir = 1;
 function renderCached() {
   const list = cached.list.slice().sort((a, b) => {
-    const x = a[cachedSort], y = b[cachedSort];
+    // Omitted numeric fields (no uploads, never opened) sort as zero rather
+    // than comparing equal to everything.
+    const x = a[cachedSort] ?? 0, y = b[cachedSort] ?? 0;
     return (x < y ? -1 : x > y ? 1 : 0) * cachedDir;
   });
   const pages = Math.max(1, Math.ceil(list.length / cachedPageSize));
