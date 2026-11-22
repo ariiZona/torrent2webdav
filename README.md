@@ -16,11 +16,13 @@ No database, no download queue, no API server.
 
 ```sh
 cp .env.example .env   # optional: choose the BitTorrent port
+cp docker-compose.example.yaml docker-compose.yml
+# edit docker-compose.yml and set TORRENT_FILE
 docker compose pull
 docker compose up -d
 ```
 
-The Compose file pulls `ghcr.io/ariizona/torrent2webdav:latest`, built by the
+The example Compose file pulls `ghcr.io/ariizona/torrent2webdav:latest`, built by the
 GitHub Actions workflow. If that package is private, run `docker login ghcr.io`
 first, or uncomment `build: .` for a local build.
 
@@ -33,8 +35,8 @@ go run . -torrent /path/to/file.torrent -cache-dir ./cache
 WebDAV is served on `127.0.0.1:8080` (localhost only) by default; see
 [LAN and TLS](#lan-and-tls) to expose it on other interfaces.
 
-Put the `.torrent` in `./torrents/` and set `TORRENT_FILE` in
-`docker-compose.yml`.
+Put the `.torrent` in `./torrents/` and set `TORRENT_FILE` in your copied
+`docker-compose.yml` (or run Compose with `-f docker-compose.example.yaml`).
 
 ## Status page
 
