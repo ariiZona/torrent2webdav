@@ -25,9 +25,7 @@ docker compose up -d
 
 The example Compose file pulls `ghcr.io/ariizona/torrent2webdav:latest`, built by the
 GitHub Actions workflow. If that package is private, run `docker login ghcr.io`
-first, or uncomment `build: .` for a local build. The container runs as uid/gid
-`1000:1000`; on Linux, make `cache` writable by that uid (see
-[Cache ownership](#cache-ownership)).
+first, or uncomment `build: .` for a local build.
 
 or without Docker:
 
@@ -191,25 +189,6 @@ environment:
   CACHE_MAX_SIZE: 50G
   CACHE_TTL: 24h
 ```
-
-## Cache ownership
-
-The image and the Compose example run as uid/gid `1000:1000`. The host cache
-directory must be writable by that uid, and the `.torrent` must be readable by
-it:
-
-```sh
-mkdir -p ./cache ./torrents
-sudo chown -R 1000:1000 ./cache
-```
-
-Skip the chown if your Linux user is uid 1000. Docker Desktop usually maps the
-bind mount for you.
-
-Upgrading from an older image that ran as root? Chown the existing cache once;
-otherwise the app stops at startup with a permission error. A named volume for
-`/cache` also works: Docker creates it with the image's ownership. If you change
-the uid in the image, set the same `user:` in Compose.
 
 ## Big torrents
 
