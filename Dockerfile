@@ -1,6 +1,7 @@
 FROM golang:1.27.4-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
+COPY third_party ./third_party
 RUN go mod download && go mod verify
 COPY *.go ./
 RUN CGO_ENABLED=0 go test ./...

@@ -26,6 +26,11 @@ table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nu
 th, td { text-align: left; padding: .32rem .5rem; border-bottom: 1px solid #242424; white-space: nowrap }
 td:first-child, th:first-child { white-space: normal; word-break: break-all }
 th { color: #888; font-weight: 500; font-size: .75rem; text-transform: uppercase; letter-spacing: .05em }
+th[data-key] { cursor: pointer; user-select: none }
+th[data-key]:focus-visible { outline: 1px solid #4c9; outline-offset: 2px }
+.pager { display: flex; gap: .6rem; align-items: center; margin-top: .5rem; color: #888 }
+.pager button { background: #1a1a1a; color: #ddd; border: 1px solid #2b2b2b; border-radius: 4px; padding: .15rem .55rem; font: inherit; cursor: pointer }
+.pager button:disabled { color: #555; cursor: default }
 ul { margin: 0; padding-left: 1.1rem }
 li { word-break: break-all }
 </style>
@@ -43,10 +48,18 @@ li { word-break: break-all }
   <div class="card"><span>BitTorrent port</span><b id="port">-</b></div>
 </div>
 <div class="muted" id="listen" style="margin-top:.5rem"></div>
+<div class="muted" id="totals" style="margin-top:.35rem"></div>
 <h2>Open files</h2><ul id="files"><li class="muted">none</li></ul>
 <h2>Cached files</h2>
-<table><thead><tr><th>File</th><th>Cached</th><th>Size</th></tr></thead>
-<tbody id="cached"><tr><td colspan="3" class="muted">none</td></tr></tbody></table>
+<table id="cachedTable"><thead><tr>
+<th data-key="name" tabindex="0">File</th>
+<th data-key="cached" tabindex="0">Cached</th>
+<th data-key="size" tabindex="0">Size</th>
+<th data-key="lastOpened" tabindex="0">Last opened</th>
+<th data-key="uploaded" tabindex="0">Uploaded</th>
+</tr></thead>
+<tbody id="cached"><tr><td colspan="5" class="muted">none</td></tr></tbody></table>
+<div class="pager" id="cachedPager"><button id="cachedPrev" type="button">Prev</button><span id="cachedPage"></span><button id="cachedNext" type="button">Next</button></div>
 <h2>Peers</h2>
 <table><thead><tr><th>Address</th><th>Source</th><th>Down</th><th>Up</th><th>Pieces</th></tr></thead>
 <tbody id="peers"><tr><td colspan="5" class="muted">none</td></tr></tbody></table>
@@ -89,6 +102,47 @@ function fileText(f) {
   const pct = f.size ? (100 * f.cached / f.size).toFixed(1) : '0.0';
   return f.name + ' - ' + pct + '% cached (' + bytes(f.cached) + ' / ' + bytes(f.size) + ')';
 }
+const cachedPageSize = 25;
+const cachedHeads = [...$('cachedTable').tHead.rows[0].cells];
+let cached = {list: [], total: 0};
+let cachedPage = 0, cachedSort = 'name', cachedDir = 1;
+function renderCached() {
+  const list = cached.list.slice().sort((a, b) => {
+    const x = a[cachedSort], y = b[cachedSort];
+    return (x < y ? -1 : x > y ? 1 : 0) * cachedDir;
+  });
+  const pages = Math.max(1, Math.ceil(list.length / cachedPageSize));
+  cachedPage = Math.min(Math.max(cachedPage, 0), pages - 1);
+  const start = cachedPage * cachedPageSize;
+  const rows = list.slice(start, start + cachedPageSize).map(f => row([
+    f.name, bytes(f.cached), bytes(f.size),
+    f.lastOpened ? new Date(f.lastOpened).toLocaleString() : '-',
+    bytes(f.uploaded || 0),
+  ]));
+  $('cached').replaceChildren(...(rows.length ? rows : [emptyRow(5)]));
+  for (const th of cachedHeads) {
+    const on = th.dataset.key === cachedSort;
+    th.setAttribute('aria-sort', on ? (cachedDir > 0 ? 'ascending' : 'descending') : 'none');
+  }
+  $('cachedPager').style.display = cached.total ? '' : 'none';
+  $('cachedPrev').disabled = cachedPage === 0;
+  $('cachedNext').disabled = cachedPage >= pages - 1;
+  $('cachedPage').textContent = 'Page ' + (cachedPage + 1) + ' of ' + pages;
+}
+function sortCached(key) {
+  if (key === cachedSort) cachedDir = -cachedDir;
+  else { cachedSort = key; cachedDir = 1; }
+  cachedPage = 0;
+  renderCached();
+}
+for (const th of cachedHeads) {
+  th.addEventListener('click', () => sortCached(th.dataset.key));
+  th.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); sortCached(th.dataset.key); }
+  });
+}
+$('cachedPrev').onclick = () => { cachedPage--; renderCached(); };
+$('cachedNext').onclick = () => { cachedPage++; renderCached(); };
 let busy = false;
 async function tick() {
   if (busy) return;
@@ -121,14 +175,13 @@ async function tick() {
   $('port').textContent = q.port + ' ' + q.portStatus;
   $('port').title = q.error || ('checked ' + (q.checked || 'not yet'));
   $('listen').textContent = s.listeners.length ? 'listening on ' + s.listeners.join(', ') : '';
+  $('totals').textContent = 'Totals: ' + bytes(s.transfer.downloaded) + ' downloaded, ' +
+    bytes(s.transfer.uploaded) + ' uploaded, ' + bytes(s.transfer.webdavSent) + ' sent over WebDAV';
   $('files').replaceChildren(...(s.openFiles.length
     ? s.openFiles.map(f => item(fileText(f) + (f.readers > 1 ? ' (' + f.readers + ' readers)' : '')))
     : [item('none', 'muted')]));
-  const cached = s.cachedFiles.map(f => row([f.name, bytes(f.cached), bytes(f.size)]));
-  if (s.cachedFilesTotal > s.cachedFiles.length) {
-    cached.push(emptyRow(3, 'showing ' + s.cachedFiles.length + ' of ' + s.cachedFilesTotal));
-  }
-  $('cached').replaceChildren(...(cached.length ? cached : [emptyRow(3)]));
+  cached = {list: s.cachedFiles, total: s.cachedFilesTotal};
+  renderCached();
   $('peers').replaceChildren(...(s.peers.length
     ? s.peers.map(p => row([p.addr, p.source, rate(p.down), rate(p.up), String(p.pieces)]))
     : [emptyRow(5)]));

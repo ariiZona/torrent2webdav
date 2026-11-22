@@ -8,6 +8,8 @@ require (
 	golang.org/x/time v0.14.0
 )
 
+replace github.com/anacrolix/torrent => ./third_party/anacrolix-torrent
+
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.16.0 // indirect
 	github.com/alecthomas/atomic v0.1.0-alpha2 // indirect

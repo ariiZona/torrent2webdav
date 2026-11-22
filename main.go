@@ -241,9 +241,15 @@ type stream struct {
 	wiping   bool
 	lastUsed time.Time
 
-	cl    *torrent.Client
-	t     *torrent.Torrent
-	share *share
+	cl      *torrent.Client
+	t       *torrent.Torrent
+	share   *share
+	uploads *uploadCounter
+
+	// Totals across cache reopens (the torrent client itself restarts) and
+	// WebDAV bytes sent for the life of the process.
+	totalDown, totalUp atomic.Int64
+	sent               atomic.Int64
 
 	done      chan struct{}
 	loopDone  chan struct{}
@@ -271,11 +277,19 @@ func newStream(torrentFile, cacheDir string, port int, maxBytes int64, ttl time.
 		fullAfter: fullAfter,
 		files:     map[string]int{},
 		fileUsed:  map[string]time.Time{},
+		uploads:   newUploadCounter(),
 		lastUsed:  time.Now(),
 		done:      make(chan struct{}),
 		loopDone:  make(chan struct{}),
 	}
 	s.cond = sync.NewCond(&s.mu)
+
+	// Keep transfer totals across restarts too.
+	if saved, ok := readTotals(s.cacheDir); ok {
+		s.totalDown.Store(max(0, saved.Downloaded))
+		s.totalUp.Store(max(0, saved.Uploaded))
+		s.sent.Store(max(0, saved.WebDAVSent))
+	}
 
 	// Keep the TTL clock across restarts instead of granting a full new TTL.
 	if used, ok := cacheMarkerTime(s.cacheDir); ok {
@@ -332,6 +346,7 @@ func (s *stream) open() {
 	if err := ensureRealDir(cfg.DataDir); err != nil {
 		log.Fatalf("cache payload: %v", err)
 	}
+	cfg.PeerUploaded = s.uploads.add
 	cfg.Slogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
 	cl, err := torrent.NewClient(cfg) // owns and closes the storage in DataDir
@@ -344,6 +359,7 @@ func (s *stream) open() {
 		log.Fatalf("add torrent: %v", err)
 	}
 	<-t.GotInfo()
+	s.uploads.reset(t.Files())
 	s.cl, s.t, s.share = cl, t, newShare(t, s.meta.CreationDate)
 	s.warmStop = make(chan struct{})
 	s.warmDone = make(chan struct{})
@@ -360,6 +376,9 @@ func (s *stream) close() {
 		s.warmStop, s.warmDone = nil, nil
 	}
 	if s.cl != nil {
+		stats := s.t.Stats()
+		s.totalDown.Add(stats.BytesReadData.Int64())
+		s.totalUp.Add(stats.BytesWrittenData.Int64())
 		s.t.Drop()   // Finish pending piece checkpoints before the client closes their database.
 		s.cl.Close() // flushes the piece-completion database and closes storage
 	}
@@ -419,15 +438,14 @@ func (s *stream) Close() {
 		<-s.loopDone
 		s.persistLastUsed()
 		s.close()
+		s.persistTotals()
 	})
 }
 
-// cleanLoop enforces the cache limits about once a minute, only while idle.
+// cleanLoop persists totals and enforces the cache limits about once a minute,
+// only while idle.
 func (s *stream) cleanLoop() {
 	defer close(s.loopDone)
-	if s.maxBytes <= 0 && s.ttl <= 0 {
-		return
-	}
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for {
@@ -435,6 +453,10 @@ func (s *stream) cleanLoop() {
 		case <-s.done:
 			return
 		case <-ticker.C:
+			s.persistTotals()
+			if s.maxBytes <= 0 && s.ttl <= 0 {
+				continue
+			}
 			s.persistLastUsed()
 			s.evictIfNeeded()
 		}
@@ -772,32 +794,38 @@ func (s *stream) fileList() []statusFile {
 	return out
 }
 
-// statusFileLimit caps how many cached files a status snapshot lists.
-const statusFileLimit = 500
-
 // cachedFileList reports files with data on disk, including files no client has
-// open, capped at statusFileLimit, and the true number of cached files. The
-// caller must hold() a snapshot, which keeps the share from being swapped while
-// it is walked outside the lock.
+// open. The caller must hold() a snapshot, which keeps the share from being
+// swapped while it is walked outside the lock.
 func (s *stream) cachedFileList() ([]statusFile, int) {
 	s.mu.Lock()
 	sh := s.share
+	used := make(map[string]time.Time, len(s.fileUsed))
+	for name, at := range s.fileUsed {
+		used[name] = at
+	}
 	s.mu.Unlock()
 	out := []statusFile{}
 	if sh == nil {
 		return out, 0
 	}
-	total := 0
 	sh.walkFiles(func(name string, e *entry) {
 		if cached := e.file.BytesCompleted(); cached > 0 {
-			total++
-			if total <= statusFileLimit {
-				out = append(out, statusFile{Name: name, Size: e.size, Cached: cached})
+			var opened int64
+			if at := used[name]; !at.IsZero() {
+				opened = at.UnixMilli()
 			}
+			out = append(out, statusFile{
+				Name:       name,
+				Size:       e.size,
+				Cached:     cached,
+				LastOpened: opened,
+				Uploaded:   s.uploads.uploaded(name),
+			})
 		}
 	})
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, total
+	return out, len(out)
 }
 
 type trackedFile struct {
@@ -812,6 +840,7 @@ func (f *trackedFile) Read(p []byte) (int, error) {
 	f.s.touch(f.name)
 	n, err := f.File.Read(p)
 	if n > 0 {
+		f.s.sent.Add(int64(n))
 		f.s.noteRead(f.e, n)
 	}
 	return n, err

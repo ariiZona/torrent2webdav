@@ -8,6 +8,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/anacrolix/torrent"
 )
 
 func TestStatusPageAndJSON(t *testing.T) {
@@ -127,11 +130,89 @@ func TestStatusReportsPerFileCache(t *testing.T) {
 	if len(got.CachedFiles) != 1 {
 		t.Fatalf("cached files = %+v", got.CachedFiles)
 	}
-	if f := got.CachedFiles[0]; f.Name != "big.t2wsmoke" || f.Size != 3<<20 || f.Cached == 0 {
+	if f := got.CachedFiles[0]; f.Name != "big.t2wsmoke" || f.Size != 3<<20 || f.Cached == 0 || f.LastOpened == 0 {
 		t.Errorf("cached file = %+v", f)
 	}
 	if got.CachedFilesTotal != len(got.CachedFiles) {
 		t.Errorf("cached files total = %d, want %d", got.CachedFilesTotal, len(got.CachedFiles))
+	}
+	if got.Transfer.Downloaded < 3<<20 {
+		t.Errorf("torrent downloaded = %d, want at least %d", got.Transfer.Downloaded, 3<<20)
+	}
+	if got.Transfer.WebDAVSent < 3<<20 {
+		t.Errorf("WebDAV sent = %d, want at least %d", got.Transfer.WebDAVSent, 3<<20)
+	}
+}
+
+// Bytes served to a peer are attributed to the cached file they came from.
+func TestStatusReportsPerFileUploads(t *testing.T) {
+	mi, torrentPath, dataRoot, _ := makeTorrent(t)
+	s := newStream(torrentPath, t.TempDir(), 0, 0, 0, 0, 0)
+	t.Cleanup(s.Close)
+
+	seeder := newTestClient(t, dataRoot, true)
+	st, err := seeder.AddTorrent(mi)
+	must(t, err)
+	<-st.GotInfo()
+	must(t, st.VerifyDataContext(t.Context()))
+
+	srv := httptest.NewServer(newStatusHandler(s, &selfTest{}))
+	defer srv.Close()
+
+	// Cache the big file through WebDAV first.
+	f, err := s.OpenFile(t.Context(), "big.t2wsmoke", 0, 0)
+	must(t, err)
+	read := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, f)
+		read <- err
+	}()
+	waitForPeer(t, s.t, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: seeder.LocalPort()})
+	must(t, <-read)
+	must(t, f.Close())
+	waitIdle(t, s)
+
+	// WebDAV reads must not look like uploads.
+	if got := fetchStatus(t, srv.URL); len(got.CachedFiles) == 1 && got.CachedFiles[0].Uploaded != 0 {
+		t.Fatalf("uploaded after a local read = %d, want 0", got.CachedFiles[0].Uploaded)
+	}
+
+	// A second client downloads the file from the share's client.
+	leech := newTestClient(t, t.TempDir(), false)
+	lt, err := leech.AddTorrent(mi)
+	must(t, err)
+	<-lt.GotInfo()
+	var big *torrent.File
+	for _, file := range lt.Files() {
+		if file.DisplayPath() == "big.t2wsmoke" {
+			big = file
+		}
+	}
+	if big == nil {
+		t.Fatal("big.t2wsmoke missing")
+	}
+	big.Download()
+	waitForPeer(t, lt, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: s.cl.LocalPort()})
+	deadline := time.Now().Add(30 * time.Second)
+	for big.BytesCompleted() < big.Length() {
+		if time.Now().After(deadline) {
+			t.Fatalf("leecher has %d of %d bytes", big.BytesCompleted(), big.Length())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	got := fetchStatus(t, srv.URL)
+	if len(got.CachedFiles) != 1 {
+		t.Fatalf("cached files = %+v", got.CachedFiles)
+	}
+	if f := got.CachedFiles[0]; f.Uploaded <= 0 {
+		t.Errorf("uploaded bytes = %d, want > 0", f.Uploaded)
+	}
+	if got.Transfer.Uploaded <= 0 {
+		t.Errorf("torrent uploaded = %d, want > 0", got.Transfer.Uploaded)
+	}
+	if got.Transfer.WebDAVSent <= 0 {
+		t.Errorf("WebDAV sent = %d, want > 0", got.Transfer.WebDAVSent)
 	}
 }
 

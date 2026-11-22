@@ -48,6 +48,7 @@ type statusTransfer struct {
 	Up         float64 `json:"up"`
 	Downloaded int64   `json:"downloaded"`
 	Uploaded   int64   `json:"uploaded"`
+	WebDAVSent int64   `json:"webdavSent"`
 }
 
 type statusPeer struct {
@@ -59,10 +60,12 @@ type statusPeer struct {
 }
 
 type statusFile struct {
-	Name    string `json:"name"`
-	Size    int64  `json:"size"`
-	Cached  int64  `json:"cached"`
-	Readers int    `json:"readers,omitempty"`
+	Name       string `json:"name"`
+	Size       int64  `json:"size"`
+	Cached     int64  `json:"cached"`
+	Readers    int    `json:"readers,omitempty"`
+	LastOpened int64  `json:"lastOpened,omitempty"` // unix milliseconds
+	Uploaded   int64  `json:"uploaded,omitempty"`   // bytes served to peers
 }
 
 type statusIP struct {
@@ -79,7 +82,7 @@ type statusSnapshot struct {
 	Transfer    statusTransfer `json:"transfer"`
 	Open        []statusFile   `json:"openFiles"`
 	CachedFiles []statusFile   `json:"cachedFiles"`
-	// CachedFilesTotal is the number of cached files before the list cap.
+	// CachedFilesTotal is the number of cached files listed.
 	CachedFilesTotal int          `json:"cachedFilesTotal"`
 	Peers            []statusPeer `json:"peers"`
 	Trackers         []string     `json:"trackers"`
@@ -138,7 +141,12 @@ func (h *statusHandler) snapshot() statusSnapshot {
 			Pending:   stats.PendingPeers,
 			HalfOpen:  stats.HalfOpenPeers,
 		},
-		Transfer:         statusTransfer{Down: down, Up: up, Downloaded: read, Uploaded: written},
+		Transfer:         statusTransfer{
+			Down: down, Up: up,
+			Downloaded: h.s.totalDown.Load() + read,
+			Uploaded:   h.s.totalUp.Load() + written,
+			WebDAVSent: h.s.sent.Load(),
+		},
 		Open:             h.s.fileList(),
 		CachedFiles:      cached,
 		CachedFilesTotal: cachedTotal,
